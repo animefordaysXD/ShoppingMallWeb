@@ -81,7 +81,7 @@ python -m http.server 4173
 ## 구조
 
 ```
-fashion-mall/
+ShoppingMallWeb/
 ├── index.html              랜딩 페이지
 ├── shop.html               컬렉션 페이지
 ├── product.html            상품 상세 페이지
@@ -135,7 +135,7 @@ fashion-mall/
 - 핵심 토큰은 `assets/css/base.css` 상단에 있습니다. 색상, 간격, 모서리, 타입 스케일, 모션을 여기서 바꾸면 전체 브랜드가 변경됩니다.
 - 로고는 관리자 **콘텐츠 → 브랜드 & SEO**에서 이미지를 업로드하면 헤더/푸터/파비콘에 반영됩니다. 이미지가 없으면 스크립트 워드마크 “To Lead”가 대체 표시됩니다.
 - 사진은 `assets/images/`에 로컬 저장되어 있습니다(Unsplash/Pexels 데모 이미지). 실제 서비스 전에는 라이선스가 있는 브랜드 사진으로 교체하세요.
-- `fashion-mall/`은 저장소 루트의 스타터 프로젝트와 의도적으로 독립되어 있습니다.
+- 이 저장소는 사이트 소스만 포함합니다. 루트의 `index.html`을 바로 열거나 GitHub Pages 같은 정적 호스팅에 그대로 배포할 수 있습니다.
 
 ---
 
