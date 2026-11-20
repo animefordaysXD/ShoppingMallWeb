@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="ko" class="no-js">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f2ede4">
+  <meta name="robots" content="noindex">
+  <title>To Lead 스튜디오 — 관리자</title>
+  <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300..600;1,9..144,300..600&family=Manrope:wght@300;400;500;600;700&family=Noto+Sans+KR:wght@300;400;500;600&family=Noto+Serif+KR:wght@300;400;500;600&family=Pinyon+Script&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/css/base.css">
+  <link rel="stylesheet" href="assets/css/admin.css">
+  <script>document.documentElement.className = document.documentElement.className.replace('no-js', 'js');</script>
+</head>
+<body class="admin-body" data-page="admin">
+  <noscript><div class="noscript-note">To Lead 스튜디오는 JavaScript가 필요합니다.</div></noscript>
+
+  <!-- Login ---------------------------------------------------------------->
+  <section class="admin-login" id="admin-login">
+    <div class="admin-login__visual">
+      <img src="assets/images/editorial-rail.jpg" alt="To Lead 스튜디오의 뉴트럴 컬러 의류가 걸린 랙">
+      <div class="admin-login__overlay">
+        <span class="wordmark" style="color:var(--paper)">To Lead</span>
+        <blockquote>“디테일이 곧 디자인입니다.”</blockquote>
+        <span class="admin-login__caption">스튜디오 액세스 · 서울 / 뉴욕 / 파리</span>
+      </div>
+    </div>
+    <div class="admin-login__panel">
+      <div class="admin-login__box">
+        <p class="eyebrow">To Lead 스튜디오</p>
+        <h1>다시 오셨네요,<br><em>관리자님.</em></h1>
+        <p class="admin-login__intro">컬렉션, 주문, 그리고 스토어프런트 콘텐츠를 관리하세요.</p>
+        <form class="admin-login__form" data-admin-login>
+          <div class="field">
+            <label for="admin-email">아이디</label>
+            <input class="input" id="admin-email" type="text" name="email" value="admin" autocomplete="username" required>
+          </div>
+          <div class="field">
+            <label for="admin-password">비밀번호</label>
+            <input class="input" id="admin-password" type="password" name="password" value="admin" autocomplete="current-password" required>
+          </div>
+          <p class="admin-login__error hide" data-login-error></p>
+          <button class="btn btn--full" type="submit">스튜디오 입장 <span aria-hidden="true">→</span></button>
+        </form>
+        <p class="admin-login__note">데모용 계정이 미리 입력되어 있습니다 (admin / admin). 모든 데이터는 이 브라우저에 저장됩니다.</p>
+        <a class="link-underline admin-login__back" href="index.html">← 스토어로 돌아가기</a>
+      </div>
+      <div class="admin-login__foot"><span>© <span data-year></span> To Lead</span><span>v1.0 · 프런트엔드 데모</span></div>
+    </div>
+  </section>
+
+  <!-- Admin app ------------------------------------------------------------>
+  <div class="admin-app" id="admin-app" hidden>
+    <aside class="admin-side" id="admin-side">
+      <div class="admin-side__brand">
+        <a class="admin-brand" href="#overview"><span>To Lead</span><small>관리자</small></a>
+      </div>
+      <div class="admin-store"><span class="status-dot"></span>스토어 운영 중 <a href="index.html" target="_blank" rel="noopener">보기 <span aria-hidden="true">↗</span></a></div>
+      <nav class="admin-nav" aria-label="스튜디오 메뉴">
+        <a href="#overview" data-admin-tab="overview" class="is-active"></a>
+        <a href="#orders" data-admin-tab="orders"></a>
+        <a href="#products" data-admin-tab="products"></a>
+        <a href="#customers" data-admin-tab="customers"></a>
+        <a href="#content" data-admin-tab="content"></a>
+        <a href="#settings" data-admin-tab="settings"></a>
+      </nav>
+      <div class="admin-side__bottom">
+        <div class="admin-side__tip">
+          <span class="eyebrow eyebrow--light">스튜디오 노트</span>
+          <p>변경 사항은 이 브라우저에 즉시 저장되고 스토어프런트에 반영됩니다.</p>
+        </div>
+        <a class="admin-side__link" href="index.html" target="_blank" rel="noopener" data-admin-store-link>스토어프런트 보기 <span aria-hidden="true">↗</span></a>
+        <button class="admin-side__link" type="button" data-admin-signout>로그아웃</button>
+      </div>
+    </aside>
+
+    <div class="admin-main">
+      <header class="admin-topbar">
+        <div class="admin-topbar__left">
+          <button class="icon-btn admin-menu-btn" type="button" data-admin-menu aria-label="메뉴 열기"></button>
+          <div class="admin-crumbs"><span>스튜디오</span><span aria-hidden="true">/</span><strong data-admin-crumb>개요</strong></div>
+        </div>
+        <div class="admin-topbar__tools">
+          <label class="admin-search">
+            <span data-search-icon aria-hidden="true"></span>
+            <input type="search" placeholder="검색 후 Enter" data-admin-search aria-label="스튜디오 검색">
+          </label>
+          <button class="icon-btn admin-bell" type="button" data-admin-notifications aria-label="알림"></button>
+          <div class="admin-user"><span class="admin-avatar">TL</span><div><strong>To Lead</strong><span>오너</span></div></div>
+        </div>
+      </header>
+      <main class="admin-content" id="admin-content"></main>
+    </div>
+
+    <div class="admin-scrim" data-admin-scrim></div>
+  </div>
+
+  <div class="admin-modal" id="admin-modal" aria-hidden="true">
+    <div class="admin-modal__dialog" role="dialog" aria-modal="true" aria-labelledby="admin-modal-title">
+      <button class="icon-btn admin-modal__close" type="button" data-admin-close aria-label="닫기"></button>
+      <div id="admin-modal-body"></div>
+    </div>
+  </div>
+
+  <div class="admin-toast-stack" data-admin-toasts role="status" aria-live="polite"></div>
+
+  <script src="assets/js/store.js"></script>
+  <script src="assets/js/admin.js"></script>
+</body>
+</html>
