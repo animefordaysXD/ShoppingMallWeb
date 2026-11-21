@@ -282,6 +282,7 @@
 
   function handleSignOut() {
     clearSession();
+    ECRU.adminSignOut();
     showLogin();
     toast('스튜디오에서 로그아웃되었습니다.', 'info');
   }
@@ -1607,8 +1608,15 @@
           '</ul>' +
         '</section>' +
         '<section class="panel settings-card settings-card--wide">' +
-          '<div><h2>데모 데이터</h2><p>모든 데이터는 <code>localStorage</code>의 <code>tolead.store.v1</code>에 저장됩니다. 큰 변경 전에는 스냅샷을 내려받아 두세요.</p></div>' +
+          '<div><h2>데모 데이터</h2><p>' + (ECRU.backendStatus().enabled
+            ? (ECRU.backendStatus().error
+              ? 'Supabase에 연결하지 못해 로컬 캐시로 동작 중입니다. 새로고침하거나 config.js와 네트워크를 확인하세요.'
+              : '스토어 데이터는 Supabase Postgres에 저장되며, 이 브라우저는 오프라인 캐시로 함께 사용됩니다.')
+            : '스토어 데이터는 <code>localStorage</code>의 <code>tolead.store.v1</code>에 저장됩니다. Supabase를 연결하면 모든 변경이 데이터베이스에 기록됩니다.') + '</p></div>' +
           '<div class="form-grid">' +
+            '<div class="settings-row"><span>데이터 저장소</span><strong>' + (ECRU.backendStatus().enabled
+              ? 'Supabase · ' + (ECRU.backendStatus().error ? '연결 오류' : ECRU.backendStatus().authenticated ? '관리자 인증됨' : '공개 키')
+              : '브라우저 localStorage') + '</strong></div>' +
             '<div class="settings-row"><span>상품</span><strong>' + products.length + '</strong></div>' +
             '<div class="settings-row"><span>주문</span><strong>' + orders.length + '</strong></div>' +
             '<div class="settings-row"><span>고객</span><strong>' + customers.length + '</strong></div>' +
@@ -1661,7 +1669,7 @@
     openModal('' +
       '<p class="eyebrow eyebrow--plain admin-modal__eyebrow">주의 구역</p>' +
       '<h2 class="admin-modal__title" id="admin-modal-title">데모 데이터를 초기화할까요?</h2>' +
-      '<p class="admin-modal__text">상품, 주문, 고객, 리뷰, 콘텐츠 설정이 초기 상태로 돌아갑니다. 이 브라우저에서 변경한 내용은 모두 사라집니다.</p>' +
+      '<p class="admin-modal__text">상품, 주문, 고객, 리뷰, 콘텐츠 설정이 초기 상태로 돌아갑니다. ' + (ECRU.backendStatus().enabled ? 'Supabase 데이터베이스의 데이터도 함께 초기화됩니다.' : '이 브라우저에서 변경한 내용은 모두 사라집니다.') + '</p>' +
       '<div class="admin-modal__actions">' +
         '<button class="btn btn--admin-ghost" type="button" data-admin-close>취소</button>' +
         '<button class="btn" type="button" data-confirm-reset>' + icon('refresh') + '전체 초기화</button>' +
@@ -1781,7 +1789,7 @@
       toast(result.message || '상품을 저장하지 못했습니다.', 'alert');
       return;
     }
-    toast(existing ? '상품을 수정했습니다 — 스토어프런트에 반영됩니다.' : '새 상품을 컬렉션에 추가했습니다.');
+    toast((existing ? '상품을 수정했습니다' : '새 상품을 컬렉션에 추가했습니다') + (ECRU.backendStatus().enabled ? ' — DB에 저장 중입니다.' : ' — 스토어프런트에 반영됩니다.'));
     closeModal();
     if (state.tab !== 'products') {
       state.productFilter = 'all';
@@ -1802,7 +1810,7 @@
       });
     });
     ECRU.updateSettings(patch);
-    toast('스토어프런트 콘텐츠를 저장했습니다.');
+    toast('스토어프런트 콘텐츠를 저장했습니다.' + (ECRU.backendStatus().enabled ? ' DB에 저장 중입니다.' : ''));
     renderTab();
   }
 
@@ -1986,7 +1994,7 @@
         var orderId = target.getAttribute('data-order-id');
         var result = ECRU.updateOrderStatus(orderId, target.value);
         if (!result.ok) { toast('주문 상태를 변경하지 못했습니다.', 'alert'); return; }
-        toast('주문 ' + orderId + '을(를) ' + ko(target.value) + '(으)로 변경했습니다.');
+        toast('주문 ' + orderId + '을(를) ' + ko(target.value) + '(으)로 변경했습니다.' + (ECRU.backendStatus().enabled ? ' DB에 저장 중입니다.' : ''));
         var modalStatus = $('#admin-modal .order-detail__head .status-pill');
         if (modalStatus) modalStatus.outerHTML = pill(target.value);
         renderTab();
@@ -2003,19 +2011,41 @@
         var email = String(data.get('email') || '').trim().toLowerCase();
         var password = String(data.get('password') || '');
         var error = form.querySelector('[data-login-error]');
-        if (email === ADMIN_EMAIL && password === ADMIN_PASSWORD) {
-          writeSession({ email: email, name: 'To Lead 관리자', at: Date.now() });
-          if (error) error.classList.add('hide');
-          showApp();
-          toast('다시 오신 것을 환영합니다, 관리자님.');
-        } else {
+        var submit = form.querySelector('button[type="submit"]');
+        function loginFailed(message) {
           if (error) {
-            error.textContent = '아이디 또는 비밀번호가 올바르지 않습니다. 미리 입력된 데모 계정(admin / admin)을 확인해 주세요.';
+            error.textContent = message;
             error.classList.remove('hide');
           }
-          var pass = $('#admin-password');
-          if (pass) pass.select();
+          if (submit) submit.disabled = false;
+          var field = $('#admin-password');
+          if (field) field.select();
         }
+        if (submit) submit.disabled = true;
+        ECRU.adminSignIn(email, password).then(function (result) {
+          if (submit) submit.disabled = false;
+          if (result.ok) {
+            writeSession({ email: email, name: 'To Lead 관리자', at: Date.now(), remote: true });
+            if (error) error.classList.add('hide');
+            showApp();
+            toast('Supabase에 연결했습니다. 변경 사항이 데이터베이스에 저장됩니다.');
+            return;
+          }
+          if (email === ADMIN_EMAIL && password === ADMIN_PASSWORD) {
+            writeSession({ email: email, name: 'To Lead 관리자', at: Date.now(), remote: false });
+            if (error) error.classList.add('hide');
+            showApp();
+            toast(ECRU.backendStatus().enabled
+              ? '로컬 데모 모드로 입장했습니다. DB 저장은 Supabase 관리자 계정으로 로그인해 주세요.'
+              : '다시 오신 것을 환영합니다, 관리자님.');
+            return;
+          }
+          loginFailed(ECRU.backendStatus().enabled
+            ? '이메일 또는 비밀번호가 올바르지 않습니다. Supabase Auth에 등록된 관리자 계정을 사용하거나, 데모 계정(admin / admin)으로 입장하세요.'
+            : '아이디 또는 비밀번호가 올바르지 않습니다. 미리 입력된 데모 계정(admin / admin)을 확인해 주세요.');
+        }).catch(function () {
+          loginFailed('로그인 처리 중 문제가 발생했습니다. 잠시 후 다시 시도해 주세요.');
+        });
         return;
       }
 
@@ -2069,7 +2099,28 @@
   function boot() {
     injectChrome();
     bindGlobal();
-    if (readSession()) showApp();
+
+    document.addEventListener('ecru:ready', function (event) {
+      renderNav();
+      var detail = event && event.detail ? event.detail : {};
+      if (detail.mode === 'local' && ECRU.backendStatus().enabled) {
+        toast('데이터베이스에 연결하지 못했습니다. 로컬 캐시로 표시 중입니다 — ' + (detail.error || ''), 'alert');
+      }
+      var app = $('#admin-app');
+      var loggedIn = !!readSession() || ECRU.backendStatus().authenticated;
+      if (loggedIn && app && !app.hidden) renderTab();
+      else if (loggedIn) showApp();
+    });
+
+    document.addEventListener('ecru:sync-error', function (event) {
+      var detail = event && event.detail ? event.detail : {};
+      var message = ECRU.backendStatus().authenticated
+        ? 'DB 저장에 실패했습니다: ' + detail.message
+        : 'DB 저장 권한이 없습니다. Supabase 관리자 계정으로 다시 로그인하거나 supabase/demo-policies.sql을 실행해 주세요.';
+      toast(message, 'alert');
+    });
+
+    if (readSession() || ECRU.backendStatus().authenticated) showApp();
     else showLogin();
   }
 

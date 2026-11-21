@@ -320,6 +320,22 @@
     if (reviews) reviews.scrollIntoView({ behavior: 'smooth', block: 'start' });
   });
 
+  document.addEventListener('ecru:ready', function () {
+    var next = requestedId ? ECRU.getProduct(requestedId) : ECRU.products()[0];
+    UI.applyContent(document);
+    if (!next) {
+      product = null;
+      notFound();
+      return;
+    }
+    product = next;
+    if (selectedSize && product.sizes.indexOf(selectedSize) === -1) selectedSize = null;
+    if (!selectedSize && product.sizes.length === 1) selectedSize = product.sizes[0];
+    selectedColor = product.colors[0] || { name: '내추럴', hex: '#cbb89d' };
+    quantity = Math.max(1, Math.min(quantity, product.stock || 1));
+    renderProduct();
+  });
+
   UI.applyContent(document);
   if (product) {
     renderProduct();

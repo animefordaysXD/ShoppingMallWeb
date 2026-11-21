@@ -143,7 +143,13 @@
 | `product.html` / `assets/js/product.js` | 한국어 PDP, 설정 기반 라벨, 상품 없음 처리 수정 |
 | `admin.html` | 한국어 로그인/앱 셸, `admin`/`admin` 프리필 |
 | `assets/js/admin.js` | 관리자 전체 한국어화, 스키마 콘텐츠 편집기, 상품 컬러/이미지, 주문/고객/설정 |
-| `assets/js/store.js` | 한국어 카탈로그, KRW, 저장 키/버전, 기본 설정, `resetSettings` |
+| `assets/js/store.js` | 한국어 카탈로그, KRW, 저장 키/버전, 기본 설정, `resetSettings`, Supabase 하이드레이션/write-through |
+| `assets/js/config.js` | Supabase URL/anon key/시드 옵션 (신규) |
+| `assets/js/backend.js` | Supabase REST/Auth 어댑터, 행↔앱 매핑, 체크아웃 RPC (신규) |
+| `supabase/schema.sql` | 테이블·트리거·뷰·RLS·`place_order` RPC (신규) |
+| `supabase/seed.sql` | 데모 데이터 SQL (신규, `generate-seed.mjs`로 생성) |
+| `supabase/demo-policies.sql` / `production-policies.sql` | 데모용 anon 정책 적용/해제 (신규) |
+| `supabase/generate-seed.mjs` | `seed.sql` 재생성 스크립트 (신규) |
 | `assets/js/ui.js` | 공통 크롬 한국어화, 로고/파비콘/콘텐츠 동기화 |
 | `assets/js/home.js` | 히어로 상품 연결, 카테고리 수, 뉴스레터 |
 | `assets/css/base.css` | 한국어 폰트/자간, 스크립트·이미지 워드마크 |
@@ -155,7 +161,38 @@
 ## 10. 알려진 제한 사항 / 다음 단계
 
 - **로고 원본 파일 미포함**: 채팅으로 받은 로고 이미지는 파일로 접근할 수 없어 아직 저장소에 없습니다. `assets/images/`에 저장하거나 관리자 **콘텐츠 → 브랜드 & SEO**에서 업로드해야 합니다.
-- **백엔드 없음**: 인증·결제·재고·주문은 모두 브라우저 시뮬레이션입니다.
-- **관리자 계정 하드코딩**: `admin` / `admin`은 데모 전용이며 서버 인증으로 교체해야 합니다.
-- **다중 탭 동기화 없음**: localStorage 스냅샷 방식이라 여러 탭에서 동시에 수정하면 마지막 저장이 이깁니다.
+- **Supabase 라이브 검증 미완료**: 프로젝트 URL/anon 키가 아직 없어 실제 호스팅 DB에 대한 읽기·쓰기 테스트는 하지 못했습니다. `config.js`를 채운 뒤 아래 체크리스트로 확인하세요.
+- **관리자 계정 하드코딩(로컬 모드)**: `admin` / `admin`은 Supabase 미설정 시 데모 전용입니다. Supabase 연결 후에는 Auth 관리자 계정으로 로그인하세요.
+- **다중 탭 동기화 없음**: localStorage 캐시와 마지막 저장이 기준입니다. Supabase 연결 시 다른 기기의 변경은 새로고침/`ECRU.refresh()`에서 반영됩니다.
 - 실제 서비스 전 연동 항목은 `README.md`의 “실제 서비스 전 연결할 항목”을 참고하세요.
+
+## 11. Supabase 백엔드 통합
+
+### 추가된 것
+- **선택형 백엔드**: `assets/js/config.js`에 URL과 anon 키가 있으면 Supabase, 없으면 기존 localStorage 데모. `window.ECRU`의 동기 API는 그대로 유지했습니다.
+- **하이드레이션**: 첫 로드에서 상품·고객·주문(+주문 상품)·리뷰·콘텐츠·구독자를 DB에서 읽어 덮어쓰고, `ECRU.ready` / `ecru:ready`로 완료를 알립니다. 홈·컬렉션·PDP·관리자는 이 이벤트에서 다시 렌더링합니다.
+- **write-through**: 관리자 콘텐츠 저장, 상품 추가/수정/삭제, 주문 상태 변경, 리뷰, 구독, 체크아웃, 전체 초기화가 Supabase REST(또는 RPC)로 즉시 전송됩니다. 실패는 `ecru:sync-error` → 토스트.
+- **체크아웃 RPC**: `place_order`가 서버의 상품 가격을 다시 계산하고 재고를 확인·차감한 뒤 주문/주문 상품을 한 트랜잭션으로 저장합니다.
+- **고객 이력**: `orders` 트리거가 `customers.total_spent`, `order_count`, `last_order_at`을 자동 갱신하고, `customer_purchase_history` 뷰가 주문별 상품 내역을 제공합니다.
+- **계정**: `accounts` 테이블이 Supabase Auth 사용자(`auth.users`)와 고객 프로필·역할(`customer`/`admin`)을 연결합니다.
+- **관리자 인증**: Supabase 설정 시 Supabase Auth 이메일/비밀번호로 로그인. 미설정 시에만 `admin`/`admin` 로컬 데모.
+- **RLS**: 공개 읽기는 상품·콘텐츠·리뷰만, 쓰기는 인증된 관리자만. 공개 데모를 위해 `demo-policies.sql`을 선택적으로 적용할 수 있습니다.
+- **시드 SQL**: 현재 데모와 동일한 상품 21개·고객 10명·주문 104건·콘텐츠를 `seed.sql`로 이식. DB가 비어 있으면 첫 방문 시 자동 시드(`seedOnEmpty`).
+- **GitHub Pages 준비**: 빌드 없이 루트 배포 그대로 동작하며, `README.md`에 Pages 설정과 Supabase 설정 절차를 정리했습니다.
+
+### 라이브 연결 후 확인 체크리스트
+- [x] PGlite(실제 Postgres 16 WASM)에서 `schema.sql` / `seed.sql` 실행 — 테이블 8개, 상품 21개, 고객 10명, 주문 104건, 주문 항목 135건 생성
+- [x] `place_order` RPC 호출 — 주문·항목 생성, 재고 차감, 고객 `total_spent`/`order_count` 트리거 갱신, `customer_purchase_history` 뷰 확인
+- [x] `demo-policies.sql` / `production-policies.sql` 실행 확인
+- [x] 모의 Supabase REST/Auth 서버로 하이드레이션, 관리자 로그인, 상품·콘텐츠·주문 상태 write-through, 체크아웃 RPC, 전체 초기화, 토큰 갱신 검증
+- [x] Supabase 미설정 및 연결 실패 시 localStorage 폴백, 관리자 오류 토스트 확인
+- [ ] 실제 Supabase 프로젝트에서 확인 (아래 항목은 자격 증명 입력 후)
+- [ ] `schema.sql` 실행 후 테이블 8개와 `place_order`, `customer_purchase_history` 생성 확인
+- [ ] `seed.sql` 실행 또는 첫 방문 자동 시드 후 스토어프런트 상품 21개 노출
+- [ ] Supabase Auth 관리자 계정으로 `admin.html` 로그인
+- [ ] 콘텐츠 저장 → 새로고침 → DB 값 유지
+- [ ] 상품 추가/수정/삭제 → 새로고침 → DB 반영
+- [ ] 장바구니 → 체크아웃 → `orders`/`order_items` 생성, 재고 차감, 고객 `total_spent` 증가
+- [ ] 주문 상태 변경 → DB 반영
+- [ ] RLS 확인: 로그아웃 상태에서 상품만 읽히고 주문/고객은 거부되는지
+- [ ] `demo-policies.sql` 적용 시 `admin`/`admin` 로컬 세션에서도 쓰기 가능한지 (데모 전용)

@@ -600,6 +600,76 @@
     document.dispatchEvent(new CustomEvent('ecru:change', { detail: { type: 'state' } }));
   }
 
+  /* Backend ---------------------------------------------------------------
+     Supabase is optional. Without config everything stays local; with config
+     the store hydrates from Postgres and each admin/customer write is mirrored
+     back. Writes are fire-and-forget so the synchronous window.ECRU API keeps
+     working exactly as before; failures surface as `ecru:sync-error`. */
+  var backend = window.ToLeadBackend || null;
+  var backendState = {
+    enabled: !!(backend && backend.enabled()),
+    ready: false,
+    error: null,
+    syncError: null
+  };
+
+  function syncRemote(label, task) {
+    if (!backendState.enabled) return;
+    Promise.resolve().then(task).catch(function (err) {
+      backendState.syncError = (err && err.message) || '알 수 없는 오류';
+      document.dispatchEvent(new CustomEvent('ecru:sync-error', {
+        detail: { label: label, message: backendState.syncError, status: err && err.status }
+      }));
+    });
+  }
+
+  function applyRemote(remote) {
+    if (!remote) return;
+    if (remote.products) state.products = remote.products;
+    if (remote.customers) state.customers = remote.customers;
+    if (remote.orders) state.orders = remote.orders;
+    if (remote.reviews) state.reviews = remote.reviews;
+    if (remote.subscribers) state.subscribers = remote.subscribers;
+    if (remote.settings) state.settings = mergeSettings(remote.settings);
+  }
+
+  function refresh() {
+    if (!backendState.enabled) return Promise.resolve(state);
+    return backend.loadStore().then(function (remote) {
+      applyRemote(remote);
+      backendState.error = null;
+      backendState.syncError = null;
+      persist();
+      document.dispatchEvent(new CustomEvent('ecru:ready', { detail: { mode: 'supabase', refresh: true } }));
+      return state;
+    });
+  }
+
+  var ready;
+  if (backendState.enabled) {
+    var seedOnEmpty = !(window.TOLEAD_CONFIG && window.TOLEAD_CONFIG.seedOnEmpty === false);
+    ready = backend.loadStore().then(function (remote) {
+      if (backend.isEmpty(remote) && seedOnEmpty) {
+        return backend.resetStore(state).then(function () { return backend.loadStore(); });
+      }
+      return remote;
+    }).then(function (remote) {
+      applyRemote(remote);
+      backendState.ready = true;
+      backendState.error = null;
+      persist();
+      document.dispatchEvent(new CustomEvent('ecru:ready', { detail: { mode: 'supabase' } }));
+      return state;
+    }).catch(function (err) {
+      backendState.ready = true;
+      backendState.error = (err && err.message) || '알 수 없는 오류';
+      document.dispatchEvent(new CustomEvent('ecru:ready', { detail: { mode: 'local', error: backendState.error } }));
+      return state;
+    });
+  } else {
+    ready = Promise.resolve(state);
+  }
+
   function slugify(value) {
     return String(value).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
   }
@@ -690,12 +760,14 @@
   function updateSettings(patch) {
     Object.assign(state.settings, patch);
     persist();
+    syncRemote('settings', function () { return backend.saveSettings(state.settings); });
     return state.settings;
   }
 
   function resetSettings() {
     state.settings = mergeSettings();
     persist();
+    syncRemote('settings', function () { return backend.saveSettings(state.settings); });
     return state.settings;
   }
 
@@ -729,6 +801,7 @@
       if (!existing) return { ok: false, message: '상품을 찾을 수 없습니다.' };
       Object.assign(existing, clean);
       persist();
+      syncRemote('product', function () { return backend.saveProduct(existing); });
       return { ok: true, product: existing };
     }
     var baseId = slugify(clean.sku) || slugify(clean.name) || ('product-' + Date.now());
@@ -738,6 +811,7 @@
     var product = Object.assign({ id: id }, clean);
     state.products.unshift(product);
     persist();
+    syncRemote('product', function () { return backend.saveProduct(product); });
     return { ok: true, product: product };
   }
 
@@ -746,6 +820,7 @@
     state.cart = state.cart.filter(function (line) { return line.productId !== id; });
     state.wishlist = state.wishlist.filter(function (wish) { return wish !== id; });
     persist();
+    syncRemote('product-delete', function () { return backend.deleteProduct(id); });
   }
 
   function getReviews(productId) {
@@ -774,6 +849,7 @@
     if (!state.reviews[productId]) state.reviews[productId] = [];
     state.reviews[productId].unshift(entry);
     persist();
+    syncRemote('review', function () { return backend.addReview(productId, entry); });
     return { ok: true, review: entry };
   }
 
@@ -782,6 +858,7 @@
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(clean)) return { ok: false, message: '올바른 이메일 주소를 입력해 주세요.' };
     if (state.subscribers.indexOf(clean) === -1) state.subscribers.push(clean);
     persist();
+    syncRemote('subscribe', function () { return backend.subscribe(clean); });
     return { ok: true };
   }
 
@@ -825,6 +902,7 @@
     state.orders.unshift(order);
     state.cart = [];
     persist();
+    syncRemote('checkout', function () { return backend.placeOrder(order); });
     return { ok: true, order: order };
   }
 
@@ -834,6 +912,9 @@
     order.status = status;
     order.payment = status === 'Cancelled' ? 'Refunded' : (order.payment === 'Refunded' ? 'Paid' : order.payment);
     persist();
+    syncRemote('order-status', function () {
+      return backend.updateOrder(id, { status: order.status, payment: order.payment });
+    });
     return { ok: true, order: order };
   }
 
@@ -906,6 +987,7 @@
   function reset() {
     state = createSeed();
     persist();
+    syncRemote('reset', function () { return backend.resetStore(state); });
     return state;
   }
 
@@ -925,6 +1007,26 @@
 
   var api = {
     state: function () { return state; },
+    ready: ready,
+    refresh: refresh,
+    backendStatus: function () {
+      return {
+        enabled: backendState.enabled,
+        ready: backendState.ready,
+        mode: !backendState.enabled ? 'local' : (backendState.error ? 'offline' : 'supabase'),
+        error: backendState.error,
+        lastSyncError: backendState.syncError,
+        authenticated: !!(backend && backend.isAuthenticated()),
+        email: backend ? backend.userEmail() : null
+      };
+    },
+    adminSignIn: function (email, password) {
+      if (!backendState.enabled) return Promise.resolve({ ok: false, message: 'local' });
+      return backend.signIn(email, password);
+    },
+    adminSignOut: function () {
+      return backend ? backend.signOut() : Promise.resolve();
+    },
     products: function () { return state.products.slice(); },
     getProduct: getProduct,
     getCart: getCart,

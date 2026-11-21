@@ -150,12 +150,22 @@
     render();
   });
 
-  UI.applyContent(document);
-  document.querySelectorAll('[data-nav-label]').forEach(function (node) {
-    var key = node.getAttribute('data-nav-label');
-    var value = ECRU.getSettings()[key];
-    if (value) node.textContent = value;
+  function applyNavLabels() {
+    document.querySelectorAll('[data-nav-label]').forEach(function (node) {
+      var key = node.getAttribute('data-nav-label');
+      var value = ECRU.getSettings()[key];
+      if (value) node.textContent = value;
+    });
+  }
+
+  document.addEventListener('ecru:ready', function () {
+    UI.applyContent(document);
+    applyNavLabels();
+    render();
   });
+
+  UI.applyContent(document);
+  applyNavLabels();
   render();
   UI.observeReveals();
 })();

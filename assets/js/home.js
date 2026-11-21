@@ -100,6 +100,12 @@
     });
   }
 
+  document.addEventListener('ecru:ready', function () {
+    applySettings();
+    setCategoryCounts();
+    renderNew(activeFilter);
+  });
+
   applySettings();
   setCategoryCounts();
   renderNew('all');

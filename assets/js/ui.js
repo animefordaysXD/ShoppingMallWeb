@@ -794,6 +794,21 @@
     yearNodes.forEach(function (node) { node.textContent = new Date().getFullYear(); });
   }
 
+  document.addEventListener('ecru:ready', function () {
+    applyContent(document);
+    syncFavicon();
+    syncCounts();
+    renderCart();
+    renderWishlist();
+  });
+
+  document.addEventListener('ecru:sync-error', function (event) {
+    var detail = event && event.detail ? event.detail : {};
+    if (detail.label === 'checkout') {
+      toast('주문을 서버에 저장하지 못했습니다. 잠시 후 다시 시도해 주세요.');
+    }
+  });
+
   window.UI = {
     icon: icon,
     esc: esc,
