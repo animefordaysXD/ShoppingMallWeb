@@ -13,7 +13,7 @@
    present the store hydrates from Supabase, and every admin save is written back
    to the database. See README.md → "Supabase backend" for setup steps. */
 window.TOLEAD_CONFIG = {
-  supabaseUrl: '',
+  supabaseUrl: 'https://wbkwxhhgjwubrbdusucn.supabase.co',
   supabaseAnonKey: '',
   /* Row id used for the shared storefront content/settings document. */
   storeId: 'main',
