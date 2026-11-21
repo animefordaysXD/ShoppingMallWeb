@@ -2027,8 +2027,18 @@
           if (result.ok) {
             writeSession({ email: email, name: 'To Lead 관리자', at: Date.now(), remote: true });
             if (error) error.classList.add('hide');
-            showApp();
-            toast('Supabase에 연결했습니다. 변경 사항이 데이터베이스에 저장됩니다.');
+            var enter = function () {
+              showApp();
+              toast('Supabase에 연결했습니다. 변경 사항이 데이터베이스에 저장됩니다.');
+            };
+            if (ECRU.backendStatus().authenticated) {
+              ECRU.refresh().then(enter).catch(function () {
+                toast('DB 데이터를 불러오지 못했습니다. 새로고침 후 다시 시도해 주세요.', 'alert');
+                enter();
+              });
+            } else {
+              enter();
+            }
             return;
           }
           if (email === ADMIN_EMAIL && password === ADMIN_PASSWORD) {
