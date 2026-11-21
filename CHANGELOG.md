@@ -151,6 +151,8 @@
 | `supabase/seed.sql` | 데모 데이터 SQL (신규, `generate-seed.mjs`로 생성) |
 | `supabase/demo-policies.sql` / `production-policies.sql` | 데모용 anon 정책 적용/해제 (신규) |
 | `supabase/generate-seed.mjs` | `seed.sql` 재생성 스크립트 (신규) |
+| `.github/workflows/pages.yml` | 비공개 경로 GitHub Pages 자동 배포 (신규) |
+| `robots.txt` | 전체 크롤링 차단 (신규) |
 | `assets/js/ui.js` | 공통 크롬 한국어화, 로고/파비콘/콘텐츠 동기화 |
 | `assets/js/home.js` | 히어로 상품 연결, 카테고리 수, 뉴스레터 |
 | `assets/css/base.css` | 한국어 폰트/자간, 스크립트·이미지 워드마크 |
@@ -198,3 +200,18 @@
 - [x] 체크아웃 → `orders`/`order_items` 생성, 재고 차감, 신규 고객 `total_spent` 증가 확인 (테스트 주문·고객·재고는 정리 완료)
 - [x] Supabase 모드에서 고객·주문 PII를 localStorage에 저장하지 않는지 확인
 - [ ] `demo-policies.sql` 적용 시 `admin`/`admin` 로컬 세션에서도 쓰기 가능한지 (데모 전용, 미적용)
+
+## 12. GitHub Pages 비공개 링크 배포
+
+- **Actions 기반 배포**: `.github/workflows/pages.yml`이 `main` 푸시마다 사이트를 `dist/`로 모아 Pages에 배포합니다.
+- **비공개 경로**: 실제 스토어 파일은 `PAGES_PATH` 저장소 시크릿(임의의 24자리 hex) 아래에 복사됩니다. Pages 루트에는 링크 없는 “Not found.” 페이지만 남습니다.
+- **검색 차단**: 모든 HTML에 `<meta name="robots" content="noindex, nofollow">`, 루트에 `robots.txt`(`Disallow: /`)를 추가했습니다.
+- **자동 갱신**: `main`에 푸시하면 새 경로 그대로 재배포됩니다. 경로 교체는 `PAGES_PATH` 시크릿 변경 후 워크플로를 다시 실행하면 됩니다.
+- **검증**:
+  - [x] Pages 루트 `https://animefordaysxd.github.io/ShoppingMallWeb/` → 200, “Not found.” 플레이스홀더만 표시
+  - [x] 비공개 경로 스토어프런트 → 상품 21개, 카드 8개, Supabase 하이드레이션, 콘솔 오류 없음
+  - [x] 비공개 경로 관리자 → 테스트 관리자 로그인, 주문 104건·고객 10명 로드
+  - [x] CSS·JS·이미지가 하위 경로에서 정상 로드
+  - [x] 잘못된 경로(`/s/not-the-link/`, `/s/`) → 404
+  - [x] 모든 페이지 `noindex`, `robots.txt` 크롤링 차단
+- **한계**: 이는 URL 비공개(obscurity)이지 인증이 아닙니다. 링크를 아는 사람은 스토어프런트를 볼 수 있고, 공개 저장소의 Actions 아티팩트를 통해 경로를 확인할 수도 있습니다. 실제 접근 제어가 필요하면 Cloudflare Access·비밀번호 보호 호스팅·GitHub Enterprise Pages 접근 제어를 사용하세요.

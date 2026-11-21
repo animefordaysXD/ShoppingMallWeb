@@ -104,10 +104,16 @@ window.TOLEAD_CONFIG = {
 
 ## GitHub Pages 배포
 
-1. 저장소 **Settings → Pages**에서 Source를 **Deploy from a branch**, 브랜치를 `main`, 폴더를 **/(root)**로 지정합니다.
-2. 잠시 후 `https://animefordaysXD.github.io/ShoppingMallWeb/`에서 열립니다.
-3. 빌드 단계가 없으므로 `main`에 푸시하면 그대로 반영됩니다. `assets/js/config.js`의 Supabase 값도 함께 배포되며, anon 키는 RLS 전제로 공개해도 됩니다.
-4. `admin.html`은 `noindex`이며 정적 페이지입니다. 실제 운영에서는 Supabase Auth 관리자 계정과 `production-policies.sql`을 사용하세요.
+저장소는 **GitHub Actions → Pages**로 배포됩니다. 실제 스토어는 추측하기 어려운 비공개 경로 아래에 올라가고, 사이트 루트에는 링크가 없는 안내 페이지만 표시됩니다.
+
+- 워크플로: `.github/workflows/pages.yml`
+- 비공개 경로: 저장소 **Settings → Secrets and variables → Actions → `PAGES_PATH`** 시크릿에 보관됩니다. 저장소를 공개해도 경로 값은 노출되지 않습니다.
+- 배포 URL: `https://animefordaysxd.github.io/ShoppingMallWeb/<PAGES_PATH>/` — 이 주소를 아는 사람에게만 공유하세요.
+- 경로를 바꾸려면 `PAGES_PATH`를 새 임의 문자열로 교체하고 **Actions → Deploy storefront to GitHub Pages → Run workflow**를 실행합니다. 이전 경로는 다음 배포 후 404가 됩니다.
+- 모든 페이지에 `noindex, nofollow`를 넣고 루트 `robots.txt`에서 크롤링을 막았습니다.
+- `main`에 푸시할 때마다 자동으로 다시 배포됩니다.
+
+> ⚠ 이 방식은 **비공개 링크(obscurity)**이지 인증이 아닙니다. 링크를 아는 사람은 누구나 스토어프런트를 볼 수 있습니다. 고객·주문 데이터는 Supabase RLS로 보호되지만, 실제 접근 제한이 필요하면 Cloudflare Access, 비밀번호 보호 호스팅, 또는 GitHub Enterprise의 Pages 접근 제어를 사용해야 합니다.
 
 ---
 
@@ -155,6 +161,7 @@ window.TOLEAD_CONFIG = {
 
 ```
 ShoppingMallWeb/
+├── .github/workflows/pages.yml  GitHub Pages 자동 배포
 ├── index.html              랜딩 페이지
 ├── shop.html               컬렉션 페이지
 ├── product.html            상품 상세 페이지
@@ -184,6 +191,7 @@ ShoppingMallWeb/
 │   ├── demo-policies.sql   공개 데모용 anon 쓰기 정책 (선택)
 │   ├── production-policies.sql  데모 정책 제거
 │   └── generate-seed.mjs   seed.sql 재생성 스크립트
+├── robots.txt              검색 엔진 크롤링 차단
 └── README.md
 ```
 
