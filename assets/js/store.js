@@ -596,7 +596,13 @@
 
   function persist() {
     memoryStore = state;
-    try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (err) { /* memory fallback */ }
+    /* With Supabase connected, customer/order PII stays in Postgres: the
+       localStorage mirror only caches the public storefront data. */
+    var mirror = state;
+    if (backendState.enabled) {
+      mirror = Object.assign({}, state, { orders: [], customers: [] });
+    }
+    try { localStorage.setItem(KEY, JSON.stringify(mirror)); } catch (err) { /* memory fallback */ }
     document.dispatchEvent(new CustomEvent('ecru:change', { detail: { type: 'state' } }));
   }
 

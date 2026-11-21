@@ -162,9 +162,10 @@
 ## 10. 알려진 제한 사항 / 다음 단계
 
 - **로고 원본 파일 미포함**: 채팅으로 받은 로고 이미지는 파일로 접근할 수 없어 아직 저장소에 없습니다. `assets/images/`에 저장하거나 관리자 **콘텐츠 → 브랜드 & SEO**에서 업로드해야 합니다.
-- **Supabase 라이브 검증 미완료**: 프로젝트 URL/anon 키가 아직 없어 실제 호스팅 DB에 대한 읽기·쓰기 테스트는 하지 못했습니다. `config.js`를 채운 뒤 아래 체크리스트로 확인하세요.
-- **관리자 계정 하드코딩(로컬 모드)**: `admin` / `admin`은 Supabase 미설정 시 데모 전용입니다. Supabase 연결 후에는 Auth 관리자 계정으로 로그인하세요.
-- **다중 탭 동기화 없음**: localStorage 캐시와 마지막 저장이 기준입니다. Supabase 연결 시 다른 기기의 변경은 새로고침/`ECRU.refresh()`에서 반영됩니다.
+- **Supabase 라이브 검증 완료**: 실제 프로젝트(`wbkwxhhgjwubrbdusucn`)에서 상품/콘텐츠 읽기, 관리자 로그인, 상품·콘텐츠·주문 상태 저장, 체크아웃, 고객 누적 구매액 트리거를 확인했습니다. 테스트 주문·고객·재고는 원상 복구했습니다.
+- **관리자 계정 하드코딩(로컬 모드)**: `admin` / `admin`은 Supabase 미설정 시 데모 전용입니다. Supabase 연결 후에는 Auth 관리자 계정으로 로그인하세요. 현재 라이브 프로젝트에는 테스트 관리자 계정이 등록되어 있으며, 운영 전 실제 관리자 계정으로 교체/삭제하세요.
+- **다중 탭 동기화 없음**: Supabase 모드에서는 관리자 로그인/새로고침 시 DB에서 다시 읽습니다. 다른 기기의 변경은 새로고침 또는 `ECRU.refresh()`에서 반영됩니다.
+- **이미지 저장**: 상품/콘텐츠 이미지는 data URL로 `products.image`·`settings.data`에 저장됩니다. 사진이 많아지면 Supabase Storage/CDN 이전이 필요합니다.
 - 실제 서비스 전 연동 항목은 `README.md`의 “실제 서비스 전 연결할 항목”을 참고하세요.
 
 ## 11. Supabase 백엔드 통합
@@ -187,13 +188,13 @@
 - [x] `demo-policies.sql` / `production-policies.sql` 실행 확인
 - [x] 모의 Supabase REST/Auth 서버로 하이드레이션, 관리자 로그인, 상품·콘텐츠·주문 상태 write-through, 체크아웃 RPC, 전체 초기화, 토큰 갱신 검증
 - [x] Supabase 미설정 및 연결 실패 시 localStorage 폴백, 관리자 오류 토스트 확인
-- [ ] 실제 Supabase 프로젝트에서 확인 (아래 항목은 자격 증명 입력 후)
-- [ ] `schema.sql` 실행 후 테이블 8개와 `place_order`, `customer_purchase_history` 생성 확인
-- [ ] `seed.sql` 실행 또는 첫 방문 자동 시드 후 스토어프런트 상품 21개 노출
-- [ ] Supabase Auth 관리자 계정으로 `admin.html` 로그인
-- [ ] 콘텐츠 저장 → 새로고침 → DB 값 유지
-- [ ] 상품 추가/수정/삭제 → 새로고침 → DB 반영
-- [ ] 장바구니 → 체크아웃 → `orders`/`order_items` 생성, 재고 차감, 고객 `total_spent` 증가
-- [ ] 주문 상태 변경 → DB 반영
-- [ ] RLS 확인: 로그아웃 상태에서 상품만 읽히고 주문/고객은 거부되는지
-- [ ] `demo-policies.sql` 적용 시 `admin`/`admin` 로컬 세션에서도 쓰기 가능한지 (데모 전용)
+- [x] 실제 Supabase 프로젝트(`wbkwxhhgjwubrbdusucn`) 연결 — `setup.sql` 실행 후 상품 21개·설정 행 로드 확인
+- [x] anon(공개) 키로 상품/설정만 읽히고 고객·주문·구독자는 RLS로 숨겨지는지 확인
+- [x] Supabase Auth 관리자 계정으로 `admin.html` 로그인 후 주문 104건·고객 10명 로드
+- [x] 고객 `total_spent`/`order_count`가 실제 주문 합계와 일치하는지 확인
+- [x] 콘텐츠 저장 → DB `settings.data` 반영 → 원래 값 복원 확인
+- [x] 상품 가격 수정 → DB `products.price` 반영 → 원래 값 복원 확인
+- [x] 주문 상태 변경 → DB 반영 및 고객 누적 구매액 트리거 갱신/복원 확인
+- [x] 체크아웃 → `orders`/`order_items` 생성, 재고 차감, 신규 고객 `total_spent` 증가 확인 (테스트 주문·고객·재고는 정리 완료)
+- [x] Supabase 모드에서 고객·주문 PII를 localStorage에 저장하지 않는지 확인
+- [ ] `demo-policies.sql` 적용 시 `admin`/`admin` 로컬 세션에서도 쓰기 가능한지 (데모 전용, 미적용)

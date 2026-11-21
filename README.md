@@ -208,6 +208,7 @@ ShoppingMallWeb/
 - 시드는 오늘을 기준으로 104개의 데모 주문을 결정론적으로 생성하므로 차트가 항상 채워져 있습니다.
 - 관리자 세션 키: `sessionStorage.tolead.admin`, Supabase 세션: `localStorage.tolead.auth.v1`
 - Supabase가 설정되면 `ecru:ready` 시점에 상품·고객·주문·리뷰·설정·구독자를 DB에서 덮어쓰고, 이후 변경은 write-through로 DB에 저장합니다. 장바구니·위시리스트는 기기별 로컬 상태로 유지됩니다.
+- Supabase 모드에서는 고객·주문 PII를 localStorage에 남기지 않습니다. 공개 상품/콘텐츠만 오프라인 캐시로 보관하고, 관리자 데이터는 인증된 세션으로 새로고침할 때마다 다시 불러옵니다.
 - `localStorage`를 사용할 수 없으면 현재 페이지 동안 메모리 객체로 대체됩니다.
 - 통화는 KRW(`ko-KR`) 기준이며 가격은 원 단위입니다.
 
