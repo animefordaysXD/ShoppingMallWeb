@@ -1,0 +1,74 @@
+name: Deploy storefront to GitHub Pages
+
+# Builds a static artifact where the store lives under a private link path
+# stored in the PAGES_PATH repository secret. The Pages root only serves a
+# neutral placeholder, so the storefront is reachable only via that exact URL.
+#
+# This is unlisted-URL access, not authentication. Anyone who knows the URL can
+# view the storefront. Customer/order data stays protected by Supabase RLS.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Check out the site
+        uses: actions/checkout@v4
+
+      - name: Prepare the private store path
+        env:
+          PAGES_PATH: ${{ secrets.PAGES_PATH }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PAGES_PATH:-}" ]; then
+            echo "PAGES_PATH repository secret is missing."
+            exit 1
+          fi
+          mkdir -p "dist/$PAGES_PATH"
+          cp index.html shop.html product.html admin.html "dist/$PAGES_PATH/"
+          cp -R assets "dist/$PAGES_PATH/"
+          cp robots.txt dist/robots.txt
+          cat > dist/index.html <<'HTML'
+          <!DOCTYPE html>
+          <html lang="ko">
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <meta name="robots" content="noindex, nofollow">
+            <title>Not found</title>
+          </head>
+          <body>
+            <p>Not found.</p>
+          </body>
+          </html>
+          HTML
+          touch dist/.nojekyll
+          echo "Prepared site artifact."
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
