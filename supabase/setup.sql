@@ -1,0 +1,650 @@
+-- To Lead — one-shot Supabase setup
+-- Combines supabase/schema.sql and supabase/seed.sql.
+-- Paste this whole file into Supabase Dashboard → SQL Editor → Run once.
+-- Safe to re-run.
+
+
+-- To Lead — Supabase schema
+-- Run once in Supabase Dashboard → SQL Editor → New query → Run.
+-- Works on a fresh project. Safe to re-run: tables are IF NOT EXISTS, functions
+-- and policies are replaced, seed data is only inserted when the tables are empty.
+--
+-- Tables: products, customers, accounts, orders, order_items, reviews, settings,
+--         subscribers. Customer rows carry order_count / total_spent /
+--         last_order_at, kept in sync from orders by a trigger.
+
+create extension if not exists pgcrypto;
+
+-- 1. Catalogue ---------------------------------------------------------------
+create table if not exists public.products (
+  id text primary key,
+  sku text not null default '',
+  name text not null,
+  gender text not null default 'women',
+  type text not null default '기성복',
+  price integer not null default 0 check (price >= 0),
+  compare_at integer check (compare_at is null or compare_at >= 0),
+  image text not null default '',
+  colors jsonb not null default '[]'::jsonb,
+  sizes text[] not null default '{}',
+  stock integer not null default 0 check (stock >= 0),
+  rating numeric(2, 1) not null default 4.7,
+  review_count integer not null default 0,
+  badge text,
+  is_new boolean not null default false,
+  description text not null default '',
+  details text[] not null default '{}',
+  composition text not null default '',
+  fit text not null default '',
+  created_at date not null default current_date,
+  updated_at timestamptz not null default now()
+);
+
+-- 2. Customers (with purchase history totals) --------------------------------
+create table if not exists public.customers (
+  id text primary key,
+  name text not null,
+  email text not null unique,
+  joined date not null default current_date,
+  segment text not null default 'New',
+  total_spent integer not null default 0,
+  order_count integer not null default 0,
+  last_order_at timestamptz,
+  created_at timestamptz not null default now()
+);
+
+-- 3. Accounts ---------------------------------------------------------------
+-- Credentials live in Supabase Auth (auth.users). This table links an auth user
+-- to a customer profile and stores the role used by RLS / the admin UI.
+create table if not exists public.accounts (
+  id uuid primary key default gen_random_uuid(),
+  auth_user_id uuid unique references auth.users (id) on delete set null,
+  customer_id text unique references public.customers (id) on delete set null,
+  email text not null unique,
+  name text,
+  role text not null default 'customer' check (role in ('customer', 'admin')),
+  created_at timestamptz not null default now()
+);
+
+-- 4. Orders -----------------------------------------------------------------
+create sequence if not exists public.order_number_seq start with 10524;
+
+create table if not exists public.orders (
+  id text primary key,
+  customer_id text references public.customers (id) on delete set null,
+  customer_name text not null,
+  customer_email text not null,
+  created_at timestamptz not null default now(),
+  subtotal integer not null default 0 check (subtotal >= 0),
+  shipping integer not null default 0 check (shipping >= 0),
+  total integer not null default 0 check (total >= 0),
+  status text not null default 'Processing' check (status in ('Processing', 'Shipped', 'Delivered', 'Cancelled')),
+  payment text not null default 'Paid' check (payment in ('Paid', 'Refunded')),
+  channel text not null default 'Online',
+  updated_at timestamptz not null default now()
+);
+create index if not exists orders_customer_email_idx on public.orders (customer_email);
+create index if not exists orders_created_at_idx on public.orders (created_at desc);
+
+create table if not exists public.order_items (
+  id bigserial primary key,
+  order_id text not null references public.orders (id) on delete cascade,
+  product_id text,
+  name text not null,
+  size text,
+  qty integer not null default 1 check (qty > 0),
+  price integer not null default 0 check (price >= 0),
+  unique (order_id, product_id, size)
+);
+create index if not exists order_items_order_idx on public.order_items (order_id);
+
+-- 5. Reviews ----------------------------------------------------------------
+create table if not exists public.reviews (
+  id text primary key,
+  product_id text not null references public.products (id) on delete cascade,
+  name text not null default '익명',
+  rating smallint not null default 5 check (rating between 1 and 5),
+  title text not null default '',
+  body text not null default '',
+  date_label text not null default '',
+  verified boolean not null default false,
+  created_at timestamptz not null default now()
+);
+create index if not exists reviews_product_idx on public.reviews (product_id, created_at desc);
+
+-- 6. Storefront content / settings ------------------------------------------
+create table if not exists public.settings (
+  id text primary key,
+  data jsonb not null default '{}'::jsonb,
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.subscribers (
+  email text primary key,
+  created_at timestamptz not null default now()
+);
+
+-- 7. Customer totals trigger ------------------------------------------------
+create or replace function public.refresh_customer_totals(p_customer_id text)
+returns void
+language sql
+security definer
+set search_path = public
+as $$
+  update public.customers c
+     set total_spent = coalesce((
+           select sum(o.total) from public.orders o
+            where o.customer_id = c.id and o.status <> 'Cancelled'
+         ), 0),
+         order_count = coalesce((
+           select count(*) from public.orders o
+            where o.customer_id = c.id and o.status <> 'Cancelled'
+         ), 0),
+         last_order_at = (
+           select max(o.created_at) from public.orders o where o.customer_id = c.id
+         )
+   where c.id = p_customer_id;
+$$;
+
+create or replace function public.orders_after_change()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if tg_op = 'DELETE' then
+    perform public.refresh_customer_totals(old.customer_id);
+    return old;
+  end if;
+
+  perform public.refresh_customer_totals(new.customer_id);
+  if tg_op = 'UPDATE' and old.customer_id is distinct from new.customer_id then
+    perform public.refresh_customer_totals(old.customer_id);
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists orders_totals on public.orders;
+create trigger orders_totals
+  after insert or update of total, status, customer_id or delete
+  on public.orders
+  for each row execute function public.orders_after_change();
+
+-- 8. Read models ------------------------------------------------------------
+-- One row per order with its line items, for the customer profile drawer.
+create or replace view public.customer_purchase_history
+with (security_invoker = true) as
+select
+  o.customer_id,
+  c.name as customer_name,
+  c.email as customer_email,
+  o.id as order_id,
+  o.created_at as ordered_at,
+  o.status,
+  o.payment,
+  o.total,
+  coalesce(
+    jsonb_agg(
+      jsonb_build_object(
+        'product_id', oi.product_id,
+        'name', oi.name,
+        'size', oi.size,
+        'qty', oi.qty,
+        'price', oi.price
+      ) order by oi.id
+    ) filter (where oi.id is not null),
+    '[]'::jsonb
+  ) as items
+from public.orders o
+join public.customers c on c.id = o.customer_id
+left join public.order_items oi on oi.order_id = o.id
+group by o.customer_id, c.name, c.email, o.id, o.created_at, o.status, o.payment, o.total;
+
+-- 9. Checkout RPC -----------------------------------------------------------
+-- Prices are re-read from products, stock is checked/decremented atomically and
+-- the customer total is updated by the trigger. Callable with the anon key.
+create or replace function public.place_order(
+  p_id text,
+  p_name text,
+  p_email text,
+  p_items jsonb,
+  p_channel text default 'Online'
+)
+returns public.orders
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_customer public.customers;
+  v_order public.orders;
+  v_item jsonb;
+  v_product public.products;
+  v_qty integer;
+  v_subtotal integer := 0;
+  v_shipping integer := 0;
+  v_free integer;
+  v_fee integer;
+begin
+  p_email := lower(trim(p_email));
+  if p_email is null or p_email = '' then
+    raise exception '이메일 주소가 필요합니다.';
+  end if;
+  if coalesce(jsonb_array_length(p_items), 0) = 0 then
+    raise exception '장바구니가 비어 있습니다.';
+  end if;
+
+  select (data ->> 'freeShipping')::int, (data ->> 'shippingFee')::int
+    into v_free, v_fee
+    from public.settings where id = 'main';
+  v_free := coalesce(v_free, 150000);
+  v_fee := coalesce(v_fee, 5000);
+
+  for v_item in select * from jsonb_array_elements(p_items) loop
+    v_qty := greatest(1, coalesce((v_item ->> 'qty')::int, 1));
+    select * into v_product from public.products where id = v_item ->> 'productId';
+    if not found then
+      raise exception '상품을 찾을 수 없습니다: %', v_item ->> 'productId';
+    end if;
+    if v_product.stock < v_qty then
+      raise exception '재고가 부족합니다: %', v_product.name;
+    end if;
+    v_subtotal := v_subtotal + v_product.price * v_qty;
+  end loop;
+
+  v_shipping := case when v_subtotal >= v_free then 0 else v_fee end;
+
+  insert into public.customers (id, name, email, joined, segment)
+  values (
+    'c' || regexp_replace(p_id, '\D', '', 'g'),
+    coalesce(nullif(trim(p_name), ''), split_part(p_email, '@', 1)),
+    p_email,
+    current_date,
+    'New'
+  )
+  on conflict (email) do update
+    set name = coalesce(nullif(trim(excluded.name), ''), public.customers.name)
+  returning * into v_customer;
+
+  insert into public.orders (
+    id, customer_id, customer_name, customer_email,
+    subtotal, shipping, total, status, payment, channel
+  ) values (
+    p_id, v_customer.id, v_customer.name, p_email,
+    v_subtotal, v_shipping, v_subtotal + v_shipping, 'Processing', 'Paid',
+    coalesce(nullif(p_channel, ''), 'Online')
+  )
+  returning * into v_order;
+
+  for v_item in select * from jsonb_array_elements(p_items) loop
+    v_qty := greatest(1, coalesce((v_item ->> 'qty')::int, 1));
+    select * into v_product from public.products where id = v_item ->> 'productId';
+    insert into public.order_items (order_id, product_id, name, size, qty, price)
+    values (v_order.id, v_product.id, v_product.name, v_item ->> 'size', v_qty, v_product.price);
+    update public.products
+       set stock = greatest(0, stock - v_qty), updated_at = now()
+     where id = v_product.id;
+  end loop;
+
+  return v_order;
+end;
+$$;
+
+-- 10. Row Level Security ----------------------------------------------------
+alter table public.products enable row level security;
+alter table public.customers enable row level security;
+alter table public.accounts enable row level security;
+alter table public.orders enable row level security;
+alter table public.order_items enable row level security;
+alter table public.reviews enable row level security;
+alter table public.settings enable row level security;
+alter table public.subscribers enable row level security;
+
+-- Public storefront reads
+drop policy if exists "public read products" on public.products;
+create policy "public read products" on public.products for select to anon, authenticated using (true);
+
+drop policy if exists "public read settings" on public.settings;
+create policy "public read settings" on public.settings for select to anon, authenticated using (true);
+
+drop policy if exists "public read reviews" on public.reviews;
+create policy "public read reviews" on public.reviews for select to anon, authenticated using (true);
+
+drop policy if exists "public create reviews" on public.reviews;
+create policy "public create reviews" on public.reviews for insert to anon, authenticated with check (true);
+
+drop policy if exists "public subscribe" on public.subscribers;
+create policy "public subscribe" on public.subscribers for insert to anon, authenticated with check (true);
+
+-- Admin (authenticated Supabase Auth users) can manage everything.
+drop policy if exists "admin products" on public.products;
+create policy "admin products" on public.products for all to authenticated using (true) with check (true);
+
+drop policy if exists "admin customers" on public.customers;
+create policy "admin customers" on public.customers for all to authenticated using (true) with check (true);
+
+drop policy if exists "admin accounts" on public.accounts;
+create policy "admin accounts" on public.accounts for all to authenticated using (true) with check (true);
+
+drop policy if exists "admin orders" on public.orders;
+create policy "admin orders" on public.orders for all to authenticated using (true) with check (true);
+
+drop policy if exists "admin order items" on public.order_items;
+create policy "admin order items" on public.order_items for all to authenticated using (true) with check (true);
+
+drop policy if exists "admin reviews" on public.reviews;
+create policy "admin reviews" on public.reviews for all to authenticated using (true) with check (true);
+
+drop policy if exists "admin settings" on public.settings;
+create policy "admin settings" on public.settings for all to authenticated using (true) with check (true);
+
+drop policy if exists "admin subscribers" on public.subscribers;
+create policy "admin subscribers" on public.subscribers for all to authenticated using (true) with check (true);
+
+-- 11. Grants ----------------------------------------------------------------
+grant usage on schema public to anon, authenticated;
+grant select on public.products, public.settings, public.reviews to anon, authenticated;
+grant insert on public.reviews, public.subscribers to anon, authenticated;
+
+grant select, insert, update, delete on
+  public.products, public.customers, public.accounts, public.orders,
+  public.order_items, public.reviews, public.settings, public.subscribers
+  to authenticated;
+
+grant usage, select on all sequences in schema public to authenticated, anon;
+grant select on public.customer_purchase_history to authenticated;
+
+grant execute on function public.place_order(text, text, text, jsonb, text) to anon, authenticated;
+
+
+-- To Lead — demo seed data
+-- Generated by supabase/generate-seed.mjs from assets/js/store.js.
+-- Run after schema.sql. Safe to re-run: conflicts are ignored.
+
+-- Products
+insert into public.products (id, sku, name, gender, type, price, compare_at, image, colors, sizes, stock, rating, review_count, badge, is_new, description, details, composition, fit, created_at) values ($tl$mara-fringed-poncho$tl$, $tl$EC-W-101$tl$, $tl$마라 프린지 포니오$tl$, $tl$women$tl$, $tl$니트웨어$tl$, 168000, null, $tl$assets/images/poncho.jpg$tl$, $tl$[{"name":"아이보리","hex":"#e9dfcd"},{"name":"오트","hex":"#c9b99f"}]$tl$::jsonb, array[$tl$XS$tl$, $tl$S$tl$, $tl$M$tl$, $tl$L$tl$]::text[], 12, 4.8, 24, $tl$신상품$tl$, true, $tl$손으로 매듭지은 프린지가 돋보이는 부드러운 울 블렌드 포니오. 여유로운 실루엣으로 자연스럽게 흘러내립니다.$tl$, array[$tl$울·캐시미어 블렌드$tl$, $tl$핸드매듭 프린지$tl$, $tl$여유로운 드레이프$tl$]::text[], $tl$울 70%, 캐시미어 30%. 드라이클리닝 전용.$tl$, $tl$모델 178cm, S 사이즈 착용.$tl$, $tl$2026-10-20$tl$::date) on conflict (id) do nothing;
+insert into public.products (id, sku, name, gender, type, price, compare_at, image, colors, sizes, stock, rating, review_count, badge, is_new, description, details, composition, fit, created_at) values ($tl$iris-cotton-dress$tl$, $tl$EC-W-102$tl$, $tl$아이리스 코튼 원피스$tl$, $tl$women$tl$, $tl$원피스$tl$, 189000, null, $tl$assets/images/dress.jpg$tl$, $tl$[{"name":"화이트","hex":"#f5f2ea"}]$tl$::jsonb, array[$tl$XS$tl$, $tl$S$tl$, $tl$M$tl$, $tl$L$tl$]::text[], 7, 4.9, 31, $tl$신상품$tl$, true, $tl$산뜻한 유기농 코튼으로 만든 로맨틱한 실루엣. 몸에 맞는 보디스에서 풍성하고 가벼운 스커트로 이어집니다.$tl$, array[$tl$유기농 코튼 포플린$tl$, $tl$조절 가능한 백 타이$tl$, $tl$미디 기장$tl$]::text[], $tl$유기농 코튼 100%. 찬물 세탁 후 자연 건조.$tl$, $tl$모델 175cm, S 사이즈 착용.$tl$, $tl$2026-10-18$tl$::date) on conflict (id) do nothing;
+insert into public.products (id, sku, name, gender, type, price, compare_at, image, colors, sizes, stock, rating, review_count, badge, is_new, description, details, composition, fit, created_at) values ($tl$sistine-belted-trench$tl$, $tl$EC-W-103$tl$, $tl$시스틴 벨티드 트렌치$tl$, $tl$women$tl$, $tl$아우터$tl$, 298000, null, $tl$assets/images/trench.jpg$tl$, $tl$[{"name":"스카이","hex":"#8ba7b8"},{"name":"샌드","hex":"#d6c3a7"}]$tl$::jsonb, array[$tl$XS$tl$, $tl$S$tl$, $tl$M$tl$, $tl$L$tl$]::text[], 4, 4.7, 18, null, false, $tl$생활 방수 코튼 트윌로 만든 모던 트렌치. 셀프 타이 벨트와 스톰 플랩이 환절기를 위해 설계되었습니다.$tl$, array[$tl$생활 방수 코튼 트윌$tl$, $tl$셀프 타이 벨트$tl$, $tl$스톰 플랩과 백 벤트$tl$]::text[], $tl$코튼 100%. 전문 드라이클리닝.$tl$, $tl$여유로운 핏. 모델 178cm, S 사이즈 착용.$tl$, $tl$2026-09-29$tl$::date) on conflict (id) do nothing;
+insert into public.products (id, sku, name, gender, type, price, compare_at, image, colors, sizes, stock, rating, review_count, badge, is_new, description, details, composition, fit, created_at) values ($tl$nocturne-leather-jacket$tl$, $tl$EC-W-104$tl$, $tl$녹턴 레더 자켓$tl$, $tl$women$tl$, $tl$아우터$tl$, 349000, null, $tl$assets/images/leather-women.jpg$tl$, $tl$[{"name":"블랙","hex":"#1b1815"}]$tl$::jsonb, array[$tl$XS$tl$, $tl$S$tl$, $tl$M$tl$, $tl$L$tl$]::text[], 9, 4.9, 42, null, false, $tl$버터처럼 부드러운 램스킨으로 만든 크롭 모토 자켓. 앤티크 하드웨어와 부드러운 어깨선이 특징입니다.$tl$, array[$tl$램스킨 100%$tl$, $tl$앤티크 메탈 하드웨어$tl$, $tl$크롭·슬림 핏$tl$]::text[], $tl$램스킨 100%. 전문 가죽 클리닝 전용.$tl$, $tl$정사이즈. 모델 178cm, S 사이즈 착용.$tl$, $tl$2026-09-15$tl$::date) on conflict (id) do nothing;
+insert into public.products (id, sku, name, gender, type, price, compare_at, image, colors, sizes, stock, rating, review_count, badge, is_new, description, details, composition, fit, created_at) values ($tl$terra-bomber-jacket$tl$, $tl$EC-W-105$tl$, $tl$테라 봄버 자켓$tl$, $tl$women$tl$, $tl$아우터$tl$, 218000, null, $tl$assets/images/bomber.jpg$tl$, $tl$[{"name":"테라코타","hex":"#b66f4f"}]$tl$::jsonb, array[$tl$XS$tl$, $tl$S$tl$, $tl$M$tl$, $tl$L$tl$]::text[], 6, 4.8, 16, null, false, $tl$은은한 광택의 워시드 큐프로로 만든 가벼운 봄버. 리브 트림과 여유로운 핏이 편안합니다.$tl$, array[$tl$워시드 큐프로$tl$, $tl$리브 트림$tl$, $tl$투웨이 지퍼$tl$]::text[], $tl$큐프로 100%. 드라이클리닝 전용.$tl$, $tl$여유로운 핏. 모델 178cm, S 사이즈 착용.$tl$, $tl$2026-09-08$tl$::date) on conflict (id) do nothing;
+insert into public.products (id, sku, name, gender, type, price, compare_at, image, colors, sizes, stock, rating, review_count, badge, is_new, description, details, composition, fit, created_at) values ($tl$pleated-wide-leg-trouser$tl$, $tl$EC-W-106$tl$, $tl$플리츠 와이드 팬츠$tl$, $tl$women$tl$, $tl$팬츠$tl$, 128000, null, $tl$assets/images/trousers.jpg$tl$, $tl$[{"name":"로즈워터","hex":"#d8b3a7"},{"name":"잉크","hex":"#1b1815"}]$tl$::jsonb, array[$tl$24$tl$, $tl$26$tl$, $tl$28$tl$, $tl$30$tl$, $tl$32$tl$]::text[], 0, 4.6, 27, null, false, $tl$앞면에 한 개의 플리츠를 넣은 하이라이즈 팬츠. 바닥을 스치는 듯 유려한 와이드 레그입니다.$tl$, array[$tl$텐셀·울 블렌드$tl$, $tl$앞면 원 플리츠$tl$, $tl$하이라이즈 와이드 핏$tl$]::text[], $tl$텐셀 68%, 울 32%. 드라이클리닝 전용.$tl$, $tl$모델 178cm, 26 사이즈 착용.$tl$, $tl$2026-08-22$tl$::date) on conflict (id) do nothing;
+insert into public.products (id, sku, name, gender, type, price, compare_at, image, colors, sizes, stock, rating, review_count, badge, is_new, description, details, composition, fit, created_at) values ($tl$sculpted-heel-boot$tl$, $tl$EC-W-107$tl$, $tl$스컬프티드 힐 부츠$tl$, $tl$women$tl$, $tl$슈즈$tl$, 198000, null, $tl$assets/images/boots-women.jpg$tl$, $tl$[{"name":"샌드","hex":"#d6c3a7"}]$tl$::jsonb, array[$tl$36$tl$, $tl$37$tl$, $tl$38$tl$, $tl$39$tl$, $tl$40$tl$]::text[], 5, 4.7, 15, null, false, $tl$부드러운 스웨이드에 조각적인 블록 힐을 더한 앵클 부츠. 사이드 지퍼와 스퀘어 토가 돋보입니다.$tl$, array[$tl$고트 스웨이드$tl$, $tl$7cm 스컬프티드 힐$tl$, $tl$가죽 안감$tl$]::text[], $tl$고트 스웨이드 갑피, 가죽 솔. 슈트리와 함께 보관하세요.$tl$, $tl$정사이즈. 힐 높이 7cm.$tl$, $tl$2026-08-30$tl$::date) on conflict (id) do nothing;
+insert into public.products (id, sku, name, gender, type, price, compare_at, image, colors, sizes, stock, rating, review_count, badge, is_new, description, details, composition, fit, created_at) values ($tl$sheer-silk-blouse$tl$, $tl$EC-W-108$tl$, $tl$시어 실크 블라우스$tl$, $tl$women$tl$, $tl$탑$tl$, 158000, null, $tl$assets/images/silk-blouse.jpg$tl$, $tl$[{"name":"누아르","hex":"#14110f"}]$tl$::jsonb, array[$tl$XS$tl$, $tl$S$tl$, $tl$M$tl$, $tl$L$tl$]::text[], 11, 4.5, 12, null, false, $tl$깃털처럼 가벼운 실크 조젯으로 만든 블라우스. 부드럽게 드레이프되는 네크라인과 시어 소매가 매력적입니다.$tl$, array[$tl$실크 조젯 100%$tl$, $tl$드레이프 네크라인$tl$, $tl$시어 소매$tl$]::text[], $tl$실크 100%. 찬물 손세탁 또는 드라이클리닝.$tl$, $tl$여유로운 핏. 모델 178cm, S 사이즈 착용.$tl$, $tl$2026-09-02$tl$::date) on conflict (id) do nothing;
+insert into public.products (id, sku, name, gender, type, price, compare_at, image, colors, sizes, stock, rating, review_count, badge, is_new, description, details, composition, fit, created_at) values ($tl$essential-heavy-tee$tl$, $tl$EC-M-201$tl$, $tl$에센셜 헤비 티$tl$, $tl$men$tl$, $tl$티셔츠$tl$, 45000, null, $tl$assets/images/tee.jpg$tl$, $tl$[{"name":"초크","hex":"#f2eee6"},{"name":"잉크","hex":"#1b1815"}]$tl$::jsonb, array[$tl$S$tl$, $tl$M$tl$, $tl$L$tl$, $tl$XL$tl$]::text[], 48, 4.8, 112, $tl$베스트셀러$tl$, false, $tl$두께감 있는 유기농 코튼으로 만든 데일리 티셔츠. 깔끔하고 탄탄한 실루엣이 오래갑니다.$tl$, array[$tl$260gsm 유기농 코튼$tl$, $tl$리브 네크라인$tl$, $tl$프리슈링크$tl$]::text[], $tl$유기농 코튼 100%. 찬물 세탁.$tl$, $tl$레귤러 핏. 모델 186cm, M 사이즈 착용.$tl$, $tl$2026-07-12$tl$::date) on conflict (id) do nothing;
+insert into public.products (id, sku, name, gender, type, price, compare_at, image, colors, sizes, stock, rating, review_count, badge, is_new, description, details, composition, fit, created_at) values ($tl$boucle-knit-sweater$tl$, $tl$EC-M-202$tl$, $tl$부클 니트 스웨터$tl$, $tl$men$tl$, $tl$니트웨어$tl$, 135000, null, $tl$assets/images/knit-men.jpg$tl$, $tl$[{"name":"그래파이트","hex":"#52514f"}]$tl$::jsonb, array[$tl$S$tl$, $tl$M$tl$, $tl$L$tl$, $tl$XL$tl$]::text[], 14, 4.9, 38, $tl$베스트셀러$tl$, false, $tl$텍스처가 살아 있는 부클 니트. 하이 넥과 드롭 숄더로 가볍지만 따뜻하게 입을 수 있습니다.$tl$, array[$tl$이탈리아 울 부클$tl$, $tl$하이 넥$tl$, $tl$드롭 숄더$tl$]::text[], $tl$울 54%, 재생 폴리아미드 46%. 찬물 손세탁.$tl$, $tl$여유로운 핏. 모델 186cm, M 사이즈 착용.$tl$, $tl$2026-08-11$tl$::date) on conflict (id) do nothing;
+insert into public.products (id, sku, name, gender, type, price, compare_at, image, colors, sizes, stock, rating, review_count, badge, is_new, description, details, composition, fit, created_at) values ($tl$rider-leather-jacket$tl$, $tl$EC-M-203$tl$, $tl$라이더 레더 자켓$tl$, $tl$men$tl$, $tl$아우터$tl$, 385000, null, $tl$assets/images/leather-men.jpg$tl$, $tl$[{"name":"블랙","hex":"#1b1815"}]$tl$::jsonb, array[$tl$S$tl$, $tl$M$tl$, $tl$L$tl$, $tl$XL$tl$]::text[], 3, 5, 21, null, false, $tl$손마감 램스킨으로 만든 비대칭 레더 자켓. 입을수록 부드럽게 길들여집니다.$tl$, array[$tl$핸드피니시 램스킨$tl$, $tl$비대칭 지퍼$tl$, $tl$큐프로 안감$tl$]::text[], $tl$램스킨 100%. 전문 가죽 클리닝 전용.$tl$, $tl$정사이즈. 모델 186cm, M 사이즈 착용.$tl$, $tl$2026-09-19$tl$::date) on conflict (id) do nothing;
+insert into public.products (id, sku, name, gender, type, price, compare_at, image, colors, sizes, stock, rating, review_count, badge, is_new, description, details, composition, fit, created_at) values ($tl$savile-suit-jacket$tl$, $tl$EC-M-204$tl$, $tl$서빌 수트 자켓$tl$, $tl$men$tl$, $tl$테일러링$tl$, 420000, null, $tl$assets/images/suit.jpg$tl$, $tl$[{"name":"코발트","hex":"#3a5c8a"},{"name":"차콜","hex":"#3c3a37"}]$tl$::jsonb, array[$tl$38$tl$, $tl$40$tl$, $tl$42$tl$, $tl$44$tl$, $tl$46$tl$]::text[], 8, 4.8, 19, null, false, $tl$중간 두께의 울 블렌드로 만든 싱글 브레스트 자켓. 하프 캔버스 구조와 부드러운 어깨, 깔끔한 라펠이 특징입니다.$tl$, array[$tl$하프 캔버스 구조$tl$, $tl$소프트 숄더$tl$, $tl$기능성 커프 버튼$tl$]::text[], $tl$울 98%, 엘라스테인 2%. 드라이클리닝 전용.$tl$, $tl$테일러드 핏. 모델 186cm, 40 사이즈 착용.$tl$, $tl$2026-09-25$tl$::date) on conflict (id) do nothing;
+insert into public.products (id, sku, name, gender, type, price, compare_at, image, colors, sizes, stock, rating, review_count, badge, is_new, description, details, composition, fit, created_at) values ($tl$relaxed-crew-sweatshirt$tl$, $tl$EC-M-205$tl$, $tl$릴랙스 크루 스웨트셔츠$tl$, $tl$men$tl$, $tl$스웨트셔츠$tl$, 95000, null, $tl$assets/images/sweatshirt.jpg$tl$, $tl$[{"name":"에크루","hex":"#e9dfcd"},{"name":"잉크","hex":"#1b1815"}]$tl$::jsonb, array[$tl$S$tl$, $tl$M$tl$, $tl$L$tl$, $tl$XL$tl$]::text[], 22, 4.7, 54, null, false, $tl$안쪽을 기모로 가공한 코튼 플리스 스웨트셔츠. 여유로운 몸판과 리브 커프가 편안합니다.$tl$, array[$tl$420gsm 기모 코튼 플리스$tl$, $tl$리브 커프와 밑단$tl$, $tl$릴랙스 핏$tl$]::text[], $tl$코튼 100%. 찬물 세탁.$tl$, $tl$여유로운 핏. 모델 186cm, M 사이즈 착용.$tl$, $tl$2026-08-05$tl$::date) on conflict (id) do nothing;
+insert into public.products (id, sku, name, gender, type, price, compare_at, image, colors, sizes, stock, rating, review_count, badge, is_new, description, details, composition, fit, created_at) values ($tl$lug-sole-boot$tl$, $tl$EC-M-206$tl$, $tl$러그 솔 부츠$tl$, $tl$men$tl$, $tl$슈즈$tl$, 215000, null, $tl$assets/images/boots-men.jpg$tl$, $tl$[{"name":"에스프레소","hex":"#4b3627"}]$tl$::jsonb, array[$tl$40$tl$, $tl$41$tl$, $tl$42$tl$, $tl$43$tl$, $tl$44$tl$]::text[], 10, 4.8, 26, null, false, $tl$러그드 코만도 솔을 적용한 굿이어 웰트 가죽 부츠. 날씨와 오랜 시간을 견디도록 만들었습니다.$tl$, array[$tl$풀그레인 가죽$tl$, $tl$굿이어 웰트$tl$, $tl$코만도 솔$tl$]::text[], $tl$가죽 갑피·안감, 고무 솔. 정기적으로 가죽 관리를 해주세요.$tl$, $tl$정사이즈. 평소 EU 사이즈를 선택하세요.$tl$, $tl$2026-09-11$tl$::date) on conflict (id) do nothing;
+insert into public.products (id, sku, name, gender, type, price, compare_at, image, colors, sizes, stock, rating, review_count, badge, is_new, description, details, composition, fit, created_at) values ($tl$suede-overshirt$tl$, $tl$EC-M-207$tl$, $tl$스웨이드 오버셔츠$tl$, $tl$men$tl$, $tl$아우터$tl$, 175000, 210000, $tl$assets/images/overshirt.jpg$tl$, $tl$[{"name":"코냑","hex":"#9a6440"}]$tl$::jsonb, array[$tl$S$tl$, $tl$M$tl$, $tl$L$tl$, $tl$XL$tl$]::text[], 7, 4.6, 14, null, false, $tl$부드러운 고트 스웨이드로 만든 셔츠 자켓. 혼 버튼과 패치 포켓이 돋보이며, 오픈하거나 여며 입을 수 있습니다.$tl$, array[$tl$고트 스웨이드$tl$, $tl$혼 버튼$tl$, $tl$패치 포켓 2개$tl$]::text[], $tl$고트 스웨이드 100%. 전문 가죽 클리닝 전용.$tl$, $tl$레귤러 핏. 모델 186cm, M 사이즈 착용.$tl$, $tl$2026-08-27$tl$::date) on conflict (id) do nothing;
+insert into public.products (id, sku, name, gender, type, price, compare_at, image, colors, sizes, stock, rating, review_count, badge, is_new, description, details, composition, fit, created_at) values ($tl$bauletto-top-handle-bag$tl$, $tl$EC-A-301$tl$, $tl$바울레토 탑핸들 백$tl$, $tl$accessories$tl$, $tl$가방$tl$, 245000, null, $tl$assets/images/bag-red.jpg$tl$, $tl$[{"name":"스칼렛","hex":"#b23a2f"},{"name":"코냑","hex":"#9a6440"}]$tl$::jsonb, array[$tl$원사이즈$tl$]::text[], 6, 4.9, 33, $tl$신상품$tl$, true, $tl$광택 있는 카프 가죽으로 만든 컴팩트 탑핸들 백. 스웨이드 안감과 탈착 가능한 스트랩이 포함됩니다.$tl$, array[$tl$광택 카프 가죽$tl$, $tl$스웨이드 안감$tl$, $tl$탈착 가능한 숄더 스트랩$tl$]::text[], $tl$카프 가죽 외피, 스웨이드 안감. 더스트백에 보관하세요.$tl$, $tl$24 × 18 × 10cm. 핸들 드롭 9cm.$tl$, $tl$2026-10-22$tl$::date) on conflict (id) do nothing;
+insert into public.products (id, sku, name, gender, type, price, compare_at, image, colors, sizes, stock, rating, review_count, badge, is_new, description, details, composition, fit, created_at) values ($tl$woven-handle-bag$tl$, $tl$EC-A-302$tl$, $tl$우븐 핸들 백$tl$, $tl$accessories$tl$, $tl$가방$tl$, 265000, 310000, $tl$assets/images/bag-orange.jpg$tl$, $tl$[{"name":"앰버","hex":"#c47a44"}]$tl$::jsonb, array[$tl$원사이즈$tl$]::text[], 4, 4.8, 17, null, false, $tl$손으로 엮은 가죽 핸들과 조각적인 실루엣. 이탈리아 피렌체의 작은 아틀리에에서 제작됩니다.$tl$, array[$tl$핸드우븐 가죽 핸들$tl$, $tl$자석 잠금$tl$, $tl$이탈리아 제조$tl$]::text[], $tl$카프 가죽. 더스트백에 보관하세요.$tl$, $tl$26 × 20 × 12cm. 핸들 드롭 8cm.$tl$, $tl$2026-10-02$tl$::date) on conflict (id) do nothing;
+insert into public.products (id, sku, name, gender, type, price, compare_at, image, colors, sizes, stock, rating, review_count, badge, is_new, description, details, composition, fit, created_at) values ($tl$akoya-pearl-strand$tl$, $tl$EC-A-303$tl$, $tl$아코야 펄 스트랜드$tl$, $tl$accessories$tl$, $tl$주얼리$tl$, 145000, null, $tl$assets/images/pearls.jpg$tl$, $tl$[{"name":"펄","hex":"#f1e8d8"}]$tl$::jsonb, array[$tl$원사이즈$tl$]::text[], 13, 4.9, 22, null, false, $tl$손으로 매듭지은 아코야 진주 목걸이. 스털링 실버 잠금장치로 마무리했습니다.$tl$, array[$tl$핸드매듭 아코야 진주$tl$, $tl$스털링 실버 잠금장치$tl$, $tl$45cm 길이$tl$]::text[], $tl$양식 진주, 925 스털링 실버. 부드러운 천으로 닦아주세요.$tl$, $tl$45cm. 42cm로 조절 가능.$tl$, $tl$2026-09-06$tl$::date) on conflict (id) do nothing;
+insert into public.products (id, sku, name, gender, type, price, compare_at, image, colors, sizes, stock, rating, review_count, badge, is_new, description, details, composition, fit, created_at) values ($tl$meridian-automatic-watch$tl$, $tl$EC-A-304$tl$, $tl$메리디안 오토매틱 워치$tl$, $tl$accessories$tl$, $tl$시계$tl$, 320000, null, $tl$assets/images/watch.jpg$tl$, $tl$[{"name":"스틸","hex":"#b9bec2"}]$tl$::jsonb, array[$tl$원사이즈$tl$]::text[], 2, 4.7, 11, null, false, $tl$선레이 다이얼과 사파이어 크리스탈, 브러시드 스틸 브레이슬릿을 갖춘 38mm 오토매틱 워치.$tl$, array[$tl$일본산 오토매틱 무브먼트$tl$, $tl$사파이어 크리스탈$tl$, $tl$38mm 브러시드 스틸 케이스$tl$]::text[], $tl$316L 스테인리스 스틸. 5 ATM 생활 방수.$tl$, $tl$38mm 케이스. 손목 둘레 14–21cm.$tl$, $tl$2026-07-30$tl$::date) on conflict (id) do nothing;
+insert into public.products (id, sku, name, gender, type, price, compare_at, image, colors, sizes, stock, rating, review_count, badge, is_new, description, details, composition, fit, created_at) values ($tl$stacking-ring-set$tl$, $tl$EC-A-305$tl$, $tl$스태킹 링 세트$tl$, $tl$accessories$tl$, $tl$주얼리$tl$, 78000, null, $tl$assets/images/rings.jpg$tl$, $tl$[{"name":"골드","hex":"#c7a261"}]$tl$::jsonb, array[$tl$6$tl$, $tl$7$tl$, $tl$8$tl$]::text[], 18, 4.5, 29, null, false, $tl$재생 14k 골드 버메일로 만든 세 개의 가는 밴드. 함께 또는 따로 착용할 수 있습니다.$tl$, array[$tl$3개 세트$tl$, $tl$재생 14k 골드 버메일$tl$, $tl$저자극 소재$tl$]::text[], $tl$925 스털링 실버에 14k 골드 버메일 도금. 수영 전 분리하세요.$tl$, $tl$US 6, 7, 8 사이즈.$tl$, $tl$2026-08-16$tl$::date) on conflict (id) do nothing;
+insert into public.products (id, sku, name, gender, type, price, compare_at, image, colors, sizes, stock, rating, review_count, badge, is_new, description, details, composition, fit, created_at) values ($tl$layered-pendant-necklace$tl$, $tl$EC-A-306$tl$, $tl$레이어드 펜던트 네클리스$tl$, $tl$accessories$tl$, $tl$주얼리$tl$, 68000, 88000, $tl$assets/images/pendant.jpg$tl$, $tl$[{"name":"골드","hex":"#c7a261"}]$tl$::jsonb, array[$tl$원사이즈$tl$]::text[], 16, 4.6, 20, null, false, $tl$손으로 세팅한 프레시워터 펄 펜던트가 달린 섬세한 더블 체인 목걸이.$tl$, array[$tl$더블 파인 체인$tl$, $tl$프레시워터 펄$tl$, $tl$조절 가능한 잠금장치$tl$]::text[], $tl$14k 골드 버메일, 프레시워터 펄. 평평하게 보관하세요.$tl$, $tl$38cm와 43cm 레이어.$tl$, $tl$2026-08-08$tl$::date) on conflict (id) do nothing;
+
+-- Customers (totals are refreshed by the orders trigger)
+insert into public.customers (id, name, email, joined, segment) values ($tl$c01$tl$, $tl$박나연$tl$, $tl$nayeon.park@example.com$tl$, $tl$2025-04-12$tl$::date, $tl$VIP$tl$) on conflict do nothing;
+insert into public.customers (id, name, email, joined, segment) values ($tl$c02$tl$, $tl$엘리아스 마이어$tl$, $tl$elias.meyer@example.com$tl$, $tl$2025-08-03$tl$::date, $tl$Returning$tl$) on conflict do nothing;
+insert into public.customers (id, name, email, joined, segment) values ($tl$c03$tl$, $tl$김소라$tl$, $tl$sora.kim@example.com$tl$, $tl$2026-01-19$tl$::date, $tl$VIP$tl$) on conflict do nothing;
+insert into public.customers (id, name, email, joined, segment) values ($tl$c04$tl$, $tl$아멜리아 하트$tl$, $tl$amelia.hart@example.com$tl$, $tl$2026-02-07$tl$::date, $tl$Returning$tl$) on conflict do nothing;
+insert into public.customers (id, name, email, joined, segment) values ($tl$c05$tl$, $tl$요나스 베버$tl$, $tl$jonas.weber@example.com$tl$, $tl$2026-03-28$tl$::date, $tl$New$tl$) on conflict do nothing;
+insert into public.customers (id, name, email, joined, segment) values ($tl$c06$tl$, $tl$클라라 모로$tl$, $tl$clara.moreau@example.com$tl$, $tl$2026-04-11$tl$::date, $tl$Returning$tl$) on conflict do nothing;
+insert into public.customers (id, name, email, joined, segment) values ($tl$c07$tl$, $tl$테오 베넷$tl$, $tl$theo.bennett@example.com$tl$, $tl$2026-05-02$tl$::date, $tl$New$tl$) on conflict do nothing;
+insert into public.customers (id, name, email, joined, segment) values ($tl$c08$tl$, $tl$최유나$tl$, $tl$yuna.choi@example.com$tl$, $tl$2026-05-30$tl$::date, $tl$VIP$tl$) on conflict do nothing;
+insert into public.customers (id, name, email, joined, segment) values ($tl$c09$tl$, $tl$이자벨 로시$tl$, $tl$isabel.rossi@example.com$tl$, $tl$2026-06-17$tl$::date, $tl$New$tl$) on conflict do nothing;
+insert into public.customers (id, name, email, joined, segment) values ($tl$c10$tl$, $tl$마커스 리드$tl$, $tl$marcus.reed@example.com$tl$, $tl$2026-07-04$tl$::date, $tl$Returning$tl$) on conflict do nothing;
+
+-- Orders and line items
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10454$tl$, $tl$c01$tl$, $tl$박나연$tl$, $tl$nayeon.park@example.com$tl$, $tl$2026-11-20T01:11:00.000Z$tl$::timestamptz, 135000, 5000, 140000, $tl$Cancelled$tl$, $tl$Refunded$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10454$tl$, $tl$boucle-knit-sweater$tl$, $tl$부클 니트 스웨터$tl$, $tl$XL$tl$, 1, 135000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10440$tl$, $tl$c09$tl$, $tl$이자벨 로시$tl$, $tl$isabel.rossi@example.com$tl$, $tl$2026-11-19T02:12:00.000Z$tl$::timestamptz, 245000, 0, 245000, $tl$Shipped$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10440$tl$, $tl$bauletto-top-handle-bag$tl$, $tl$바울레토 탑핸들 백$tl$, $tl$원사이즈$tl$, 1, 245000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10466$tl$, $tl$c02$tl$, $tl$엘리아스 마이어$tl$, $tl$elias.meyer@example.com$tl$, $tl$2026-11-18T03:13:00.000Z$tl$::timestamptz, 220000, 0, 220000, $tl$Processing$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10466$tl$, $tl$essential-heavy-tee$tl$, $tl$에센셜 헤비 티$tl$, $tl$S$tl$, 1, 45000) on conflict do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10466$tl$, $tl$suede-overshirt$tl$, $tl$스웨이드 오버셔츠$tl$, $tl$XL$tl$, 1, 175000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10486$tl$, $tl$c04$tl$, $tl$아멜리아 하트$tl$, $tl$amelia.hart@example.com$tl$, $tl$2026-11-17T04:14:00.000Z$tl$::timestamptz, 420000, 0, 420000, $tl$Processing$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10486$tl$, $tl$savile-suit-jacket$tl$, $tl$서빌 수트 자켓$tl$, $tl$40$tl$, 1, 420000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10523$tl$, $tl$c06$tl$, $tl$클라라 모로$tl$, $tl$clara.moreau@example.com$tl$, $tl$2026-11-14T07:17:00.000Z$tl$::timestamptz, 198000, 0, 198000, $tl$Shipped$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10523$tl$, $tl$sculpted-heel-boot$tl$, $tl$스컬프티드 힐 부츠$tl$, $tl$36$tl$, 1, 198000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10438$tl$, $tl$c05$tl$, $tl$요나스 베버$tl$, $tl$jonas.weber@example.com$tl$, $tl$2026-11-12T01:19:00.000Z$tl$::timestamptz, 320000, 0, 320000, $tl$Shipped$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10438$tl$, $tl$meridian-automatic-watch$tl$, $tl$메리디안 오토매틱 워치$tl$, $tl$원사이즈$tl$, 1, 320000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10480$tl$, $tl$c01$tl$, $tl$박나연$tl$, $tl$nayeon.park@example.com$tl$, $tl$2026-11-11T02:20:00.000Z$tl$::timestamptz, 373000, 0, 373000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Boutique$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10480$tl$, $tl$bauletto-top-handle-bag$tl$, $tl$바울레토 탑핸들 백$tl$, $tl$원사이즈$tl$, 1, 245000) on conflict do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10480$tl$, $tl$pleated-wide-leg-trouser$tl$, $tl$플리츠 와이드 팬츠$tl$, $tl$30$tl$, 1, 128000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10514$tl$, $tl$c07$tl$, $tl$테오 베넷$tl$, $tl$theo.bennett@example.com$tl$, $tl$2026-11-09T04:22:00.000Z$tl$::timestamptz, 158000, 0, 158000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10514$tl$, $tl$sheer-silk-blouse$tl$, $tl$시어 실크 블라우스$tl$, $tl$M$tl$, 1, 158000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10517$tl$, $tl$c01$tl$, $tl$박나연$tl$, $tl$nayeon.park@example.com$tl$, $tl$2026-11-08T05:23:00.000Z$tl$::timestamptz, 480000, 0, 480000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10517$tl$, $tl$akoya-pearl-strand$tl$, $tl$아코야 펄 스트랜드$tl$, $tl$원사이즈$tl$, 2, 145000) on conflict do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10517$tl$, $tl$relaxed-crew-sweatshirt$tl$, $tl$릴랙스 크루 스웨트셔츠$tl$, $tl$L$tl$, 2, 95000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10518$tl$, $tl$c10$tl$, $tl$마커스 리드$tl$, $tl$marcus.reed@example.com$tl$, $tl$2026-11-07T06:24:00.000Z$tl$::timestamptz, 766000, 0, 766000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10518$tl$, $tl$nocturne-leather-jacket$tl$, $tl$녹턴 레더 자켓$tl$, $tl$L$tl$, 2, 349000) on conflict do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10518$tl$, $tl$layered-pendant-necklace$tl$, $tl$레이어드 펜던트 네클리스$tl$, $tl$원사이즈$tl$, 1, 68000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10441$tl$, $tl$c01$tl$, $tl$박나연$tl$, $tl$nayeon.park@example.com$tl$, $tl$2026-11-04T01:27:00.000Z$tl$::timestamptz, 95000, 5000, 100000, $tl$Shipped$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10441$tl$, $tl$relaxed-crew-sweatshirt$tl$, $tl$릴랙스 크루 스웨트셔츠$tl$, $tl$XL$tl$, 1, 95000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10447$tl$, $tl$c04$tl$, $tl$아멜리아 하트$tl$, $tl$amelia.hart@example.com$tl$, $tl$2026-11-04T01:27:00.000Z$tl$::timestamptz, 320000, 0, 320000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10447$tl$, $tl$meridian-automatic-watch$tl$, $tl$메리디안 오토매틱 워치$tl$, $tl$원사이즈$tl$, 1, 320000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10462$tl$, $tl$c10$tl$, $tl$마커스 리드$tl$, $tl$marcus.reed@example.com$tl$, $tl$2026-11-04T01:27:00.000Z$tl$::timestamptz, 245000, 0, 245000, $tl$Cancelled$tl$, $tl$Refunded$tl$, $tl$Boutique$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10462$tl$, $tl$bauletto-top-handle-bag$tl$, $tl$바울레토 탑핸들 백$tl$, $tl$원사이즈$tl$, 1, 245000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10491$tl$, $tl$c09$tl$, $tl$이자벨 로시$tl$, $tl$isabel.rossi@example.com$tl$, $tl$2026-11-04T01:27:00.000Z$tl$::timestamptz, 520000, 0, 520000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Boutique$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10491$tl$, $tl$rider-leather-jacket$tl$, $tl$라이더 레더 자켓$tl$, $tl$S$tl$, 1, 385000) on conflict do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10491$tl$, $tl$boucle-knit-sweater$tl$, $tl$부클 니트 스웨터$tl$, $tl$S$tl$, 1, 135000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10424$tl$, $tl$c06$tl$, $tl$클라라 모로$tl$, $tl$clara.moreau@example.com$tl$, $tl$2026-11-02T03:29:00.000Z$tl$::timestamptz, 349000, 0, 349000, $tl$Shipped$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10424$tl$, $tl$nocturne-leather-jacket$tl$, $tl$녹턴 레더 자켓$tl$, $tl$M$tl$, 1, 349000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10483$tl$, $tl$c07$tl$, $tl$테오 베넷$tl$, $tl$theo.bennett@example.com$tl$, $tl$2026-10-30T06:32:00.000Z$tl$::timestamptz, 705000, 0, 705000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10483$tl$, $tl$meridian-automatic-watch$tl$, $tl$메리디안 오토매틱 워치$tl$, $tl$원사이즈$tl$, 1, 320000) on conflict do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10483$tl$, $tl$rider-leather-jacket$tl$, $tl$라이더 레더 자켓$tl$, $tl$XL$tl$, 1, 385000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10473$tl$, $tl$c10$tl$, $tl$마커스 리드$tl$, $tl$marcus.reed@example.com$tl$, $tl$2026-10-29T07:33:00.000Z$tl$::timestamptz, 298000, 0, 298000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10473$tl$, $tl$sistine-belted-trench$tl$, $tl$시스틴 벨티드 트렌치$tl$, $tl$XS$tl$, 1, 298000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10453$tl$, $tl$c09$tl$, $tl$이자벨 로시$tl$, $tl$isabel.rossi@example.com$tl$, $tl$2026-10-28T00:34:00.000Z$tl$::timestamptz, 198000, 0, 198000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10453$tl$, $tl$sculpted-heel-boot$tl$, $tl$스컬프티드 힐 부츠$tl$, $tl$38$tl$, 1, 198000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10431$tl$, $tl$c01$tl$, $tl$박나연$tl$, $tl$nayeon.park@example.com$tl$, $tl$2026-10-27T01:35:00.000Z$tl$::timestamptz, 218000, 0, 218000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10431$tl$, $tl$terra-bomber-jacket$tl$, $tl$테라 봄버 자켓$tl$, $tl$XS$tl$, 1, 218000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10502$tl$, $tl$c01$tl$, $tl$박나연$tl$, $tl$nayeon.park@example.com$tl$, $tl$2026-10-27T01:35:00.000Z$tl$::timestamptz, 404000, 0, 404000, $tl$Processing$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10502$tl$, $tl$iris-cotton-dress$tl$, $tl$아이리스 코튼 원피스$tl$, $tl$S$tl$, 1, 189000) on conflict do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10502$tl$, $tl$lug-sole-boot$tl$, $tl$러그 솔 부츠$tl$, $tl$43$tl$, 1, 215000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10493$tl$, $tl$c10$tl$, $tl$마커스 리드$tl$, $tl$marcus.reed@example.com$tl$, $tl$2026-10-26T02:36:00.000Z$tl$::timestamptz, 304000, 0, 304000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Boutique$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10493$tl$, $tl$mara-fringed-poncho$tl$, $tl$마라 프린지 포니오$tl$, $tl$S$tl$, 1, 168000) on conflict do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10493$tl$, $tl$layered-pendant-necklace$tl$, $tl$레이어드 펜던트 네클리스$tl$, $tl$원사이즈$tl$, 2, 68000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10434$tl$, $tl$c10$tl$, $tl$마커스 리드$tl$, $tl$marcus.reed@example.com$tl$, $tl$2026-10-25T03:37:00.000Z$tl$::timestamptz, 661000, 0, 661000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10434$tl$, $tl$sculpted-heel-boot$tl$, $tl$스컬프티드 힐 부츠$tl$, $tl$39$tl$, 2, 198000) on conflict do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10434$tl$, $tl$woven-handle-bag$tl$, $tl$우븐 핸들 백$tl$, $tl$원사이즈$tl$, 1, 265000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10443$tl$, $tl$c10$tl$, $tl$마커스 리드$tl$, $tl$marcus.reed@example.com$tl$, $tl$2026-10-25T03:37:00.000Z$tl$::timestamptz, 385000, 0, 385000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10443$tl$, $tl$rider-leather-jacket$tl$, $tl$라이더 레더 자켓$tl$, $tl$M$tl$, 1, 385000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10510$tl$, $tl$c01$tl$, $tl$박나연$tl$, $tl$nayeon.park@example.com$tl$, $tl$2026-10-25T03:37:00.000Z$tl$::timestamptz, 436000, 0, 436000, $tl$Cancelled$tl$, $tl$Refunded$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10510$tl$, $tl$terra-bomber-jacket$tl$, $tl$테라 봄버 자켓$tl$, $tl$XS$tl$, 2, 218000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10464$tl$, $tl$c07$tl$, $tl$테오 베넷$tl$, $tl$theo.bennett@example.com$tl$, $tl$2026-10-24T04:38:00.000Z$tl$::timestamptz, 426000, 0, 426000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10464$tl$, $tl$sistine-belted-trench$tl$, $tl$시스틴 벨티드 트렌치$tl$, $tl$XS$tl$, 1, 298000) on conflict do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10464$tl$, $tl$pleated-wide-leg-trouser$tl$, $tl$플리츠 와이드 팬츠$tl$, $tl$28$tl$, 1, 128000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10446$tl$, $tl$c05$tl$, $tl$요나스 베버$tl$, $tl$jonas.weber@example.com$tl$, $tl$2026-10-23T05:39:00.000Z$tl$::timestamptz, 45000, 5000, 50000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10446$tl$, $tl$essential-heavy-tee$tl$, $tl$에센셜 헤비 티$tl$, $tl$L$tl$, 1, 45000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10452$tl$, $tl$c04$tl$, $tl$아멜리아 하트$tl$, $tl$amelia.hart@example.com$tl$, $tl$2026-10-22T06:40:00.000Z$tl$::timestamptz, 396000, 0, 396000, $tl$Shipped$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10452$tl$, $tl$sculpted-heel-boot$tl$, $tl$스컬프티드 힐 부츠$tl$, $tl$40$tl$, 2, 198000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10450$tl$, $tl$c10$tl$, $tl$마커스 리드$tl$, $tl$marcus.reed@example.com$tl$, $tl$2026-10-21T07:41:00.000Z$tl$::timestamptz, 128000, 5000, 133000, $tl$Processing$tl$, $tl$Paid$tl$, $tl$Boutique$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10450$tl$, $tl$pleated-wide-leg-trouser$tl$, $tl$플리츠 와이드 팬츠$tl$, $tl$28$tl$, 1, 128000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10461$tl$, $tl$c08$tl$, $tl$최유나$tl$, $tl$yuna.choi@example.com$tl$, $tl$2026-10-20T00:42:00.000Z$tl$::timestamptz, 780000, 0, 780000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Boutique$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10461$tl$, $tl$bauletto-top-handle-bag$tl$, $tl$바울레토 탑핸들 백$tl$, $tl$원사이즈$tl$, 2, 245000) on conflict do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10461$tl$, $tl$akoya-pearl-strand$tl$, $tl$아코야 펄 스트랜드$tl$, $tl$원사이즈$tl$, 2, 145000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10505$tl$, $tl$c02$tl$, $tl$엘리아스 마이어$tl$, $tl$elias.meyer@example.com$tl$, $tl$2026-10-20T00:42:00.000Z$tl$::timestamptz, 430000, 0, 430000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10505$tl$, $tl$lug-sole-boot$tl$, $tl$러그 솔 부츠$tl$, $tl$43$tl$, 2, 215000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10498$tl$, $tl$c08$tl$, $tl$최유나$tl$, $tl$yuna.choi@example.com$tl$, $tl$2026-10-19T01:43:00.000Z$tl$::timestamptz, 218000, 0, 218000, $tl$Shipped$tl$, $tl$Paid$tl$, $tl$Boutique$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10498$tl$, $tl$terra-bomber-jacket$tl$, $tl$테라 봄버 자켓$tl$, $tl$S$tl$, 1, 218000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10469$tl$, $tl$c10$tl$, $tl$마커스 리드$tl$, $tl$marcus.reed@example.com$tl$, $tl$2026-10-18T02:44:00.000Z$tl$::timestamptz, 245000, 0, 245000, $tl$Shipped$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10469$tl$, $tl$bauletto-top-handle-bag$tl$, $tl$바울레토 탑핸들 백$tl$, $tl$원사이즈$tl$, 1, 245000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10494$tl$, $tl$c06$tl$, $tl$클라라 모로$tl$, $tl$clara.moreau@example.com$tl$, $tl$2026-10-18T02:44:00.000Z$tl$::timestamptz, 135000, 5000, 140000, $tl$Cancelled$tl$, $tl$Refunded$tl$, $tl$Boutique$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10494$tl$, $tl$boucle-knit-sweater$tl$, $tl$부클 니트 스웨터$tl$, $tl$S$tl$, 1, 135000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10455$tl$, $tl$c03$tl$, $tl$김소라$tl$, $tl$sora.kim@example.com$tl$, $tl$2026-10-17T03:45:00.000Z$tl$::timestamptz, 361000, 0, 361000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10455$tl$, $tl$essential-heavy-tee$tl$, $tl$에센셜 헤비 티$tl$, $tl$M$tl$, 1, 45000) on conflict do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10455$tl$, $tl$sheer-silk-blouse$tl$, $tl$시어 실크 블라우스$tl$, $tl$XS$tl$, 2, 158000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10520$tl$, $tl$c01$tl$, $tl$박나연$tl$, $tl$nayeon.park@example.com$tl$, $tl$2026-10-17T03:45:00.000Z$tl$::timestamptz, 414000, 0, 414000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10520$tl$, $tl$sheer-silk-blouse$tl$, $tl$시어 실크 블라우스$tl$, $tl$M$tl$, 1, 158000) on conflict do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10520$tl$, $tl$pleated-wide-leg-trouser$tl$, $tl$플리츠 와이드 팬츠$tl$, $tl$28$tl$, 2, 128000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10467$tl$, $tl$c06$tl$, $tl$클라라 모로$tl$, $tl$clara.moreau@example.com$tl$, $tl$2026-10-16T04:46:00.000Z$tl$::timestamptz, 145000, 5000, 150000, $tl$Shipped$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10467$tl$, $tl$akoya-pearl-strand$tl$, $tl$아코야 펄 스트랜드$tl$, $tl$원사이즈$tl$, 1, 145000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10492$tl$, $tl$c04$tl$, $tl$아멜리아 하트$tl$, $tl$amelia.hart@example.com$tl$, $tl$2026-10-16T04:46:00.000Z$tl$::timestamptz, 158000, 0, 158000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10492$tl$, $tl$sheer-silk-blouse$tl$, $tl$시어 실크 블라우스$tl$, $tl$M$tl$, 1, 158000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10516$tl$, $tl$c06$tl$, $tl$클라라 모로$tl$, $tl$clara.moreau@example.com$tl$, $tl$2026-10-16T04:46:00.000Z$tl$::timestamptz, 45000, 5000, 50000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10516$tl$, $tl$essential-heavy-tee$tl$, $tl$에센셜 헤비 티$tl$, $tl$S$tl$, 1, 45000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10433$tl$, $tl$c03$tl$, $tl$김소라$tl$, $tl$sora.kim@example.com$tl$, $tl$2026-10-15T05:47:00.000Z$tl$::timestamptz, 145000, 5000, 150000, $tl$Processing$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10433$tl$, $tl$akoya-pearl-strand$tl$, $tl$아코야 펄 스트랜드$tl$, $tl$원사이즈$tl$, 1, 145000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10503$tl$, $tl$c01$tl$, $tl$박나연$tl$, $tl$nayeon.park@example.com$tl$, $tl$2026-10-15T05:47:00.000Z$tl$::timestamptz, 413000, 0, 413000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10503$tl$, $tl$mara-fringed-poncho$tl$, $tl$마라 프린지 포니오$tl$, $tl$M$tl$, 1, 168000) on conflict do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10503$tl$, $tl$bauletto-top-handle-bag$tl$, $tl$바울레토 탑핸들 백$tl$, $tl$원사이즈$tl$, 1, 245000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10507$tl$, $tl$c04$tl$, $tl$아멜리아 하트$tl$, $tl$amelia.hart@example.com$tl$, $tl$2026-10-15T05:47:00.000Z$tl$::timestamptz, 189000, 0, 189000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10507$tl$, $tl$iris-cotton-dress$tl$, $tl$아이리스 코튼 원피스$tl$, $tl$L$tl$, 1, 189000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10460$tl$, $tl$c02$tl$, $tl$엘리아스 마이어$tl$, $tl$elias.meyer@example.com$tl$, $tl$2026-10-13T07:49:00.000Z$tl$::timestamptz, 520000, 0, 520000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10460$tl$, $tl$rider-leather-jacket$tl$, $tl$라이더 레더 자켓$tl$, $tl$L$tl$, 1, 385000) on conflict do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10460$tl$, $tl$boucle-knit-sweater$tl$, $tl$부클 니트 스웨터$tl$, $tl$XL$tl$, 1, 135000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10488$tl$, $tl$c07$tl$, $tl$테오 베넷$tl$, $tl$theo.bennett@example.com$tl$, $tl$2026-10-13T07:49:00.000Z$tl$::timestamptz, 303000, 0, 303000, $tl$Shipped$tl$, $tl$Paid$tl$, $tl$Boutique$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10488$tl$, $tl$mara-fringed-poncho$tl$, $tl$마라 프린지 포니오$tl$, $tl$L$tl$, 1, 168000) on conflict do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10488$tl$, $tl$boucle-knit-sweater$tl$, $tl$부클 니트 스웨터$tl$, $tl$L$tl$, 1, 135000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10499$tl$, $tl$c10$tl$, $tl$마커스 리드$tl$, $tl$marcus.reed@example.com$tl$, $tl$2026-10-12T00:10:00.000Z$tl$::timestamptz, 316000, 0, 316000, $tl$Cancelled$tl$, $tl$Refunded$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10499$tl$, $tl$sheer-silk-blouse$tl$, $tl$시어 실크 블라우스$tl$, $tl$XS$tl$, 2, 158000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10425$tl$, $tl$c02$tl$, $tl$엘리아스 마이어$tl$, $tl$elias.meyer@example.com$tl$, $tl$2026-10-11T01:11:00.000Z$tl$::timestamptz, 385000, 0, 385000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10425$tl$, $tl$rider-leather-jacket$tl$, $tl$라이더 레더 자켓$tl$, $tl$S$tl$, 1, 385000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10497$tl$, $tl$c09$tl$, $tl$이자벨 로시$tl$, $tl$isabel.rossi@example.com$tl$, $tl$2026-10-11T01:11:00.000Z$tl$::timestamptz, 349000, 0, 349000, $tl$Cancelled$tl$, $tl$Refunded$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10497$tl$, $tl$nocturne-leather-jacket$tl$, $tl$녹턴 레더 자켓$tl$, $tl$L$tl$, 1, 349000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10429$tl$, $tl$c06$tl$, $tl$클라라 모로$tl$, $tl$clara.moreau@example.com$tl$, $tl$2026-10-10T02:12:00.000Z$tl$::timestamptz, 68000, 5000, 73000, $tl$Shipped$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10429$tl$, $tl$layered-pendant-necklace$tl$, $tl$레이어드 펜던트 네클리스$tl$, $tl$원사이즈$tl$, 1, 68000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10495$tl$, $tl$c03$tl$, $tl$김소라$tl$, $tl$sora.kim@example.com$tl$, $tl$2026-10-09T03:13:00.000Z$tl$::timestamptz, 198000, 0, 198000, $tl$Shipped$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10495$tl$, $tl$sculpted-heel-boot$tl$, $tl$스컬프티드 힐 부츠$tl$, $tl$37$tl$, 1, 198000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10423$tl$, $tl$c07$tl$, $tl$테오 베넷$tl$, $tl$theo.bennett@example.com$tl$, $tl$2026-10-08T04:14:00.000Z$tl$::timestamptz, 349000, 0, 349000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10423$tl$, $tl$nocturne-leather-jacket$tl$, $tl$녹턴 레더 자켓$tl$, $tl$XS$tl$, 1, 349000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10457$tl$, $tl$c08$tl$, $tl$최유나$tl$, $tl$yuna.choi@example.com$tl$, $tl$2026-10-07T05:15:00.000Z$tl$::timestamptz, 513000, 0, 513000, $tl$Processing$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10457$tl$, $tl$pleated-wide-leg-trouser$tl$, $tl$플리츠 와이드 팬츠$tl$, $tl$30$tl$, 1, 128000) on conflict do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10457$tl$, $tl$rider-leather-jacket$tl$, $tl$라이더 레더 자켓$tl$, $tl$L$tl$, 1, 385000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10430$tl$, $tl$c10$tl$, $tl$마커스 리드$tl$, $tl$marcus.reed@example.com$tl$, $tl$2026-10-06T06:16:00.000Z$tl$::timestamptz, 45000, 5000, 50000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10430$tl$, $tl$essential-heavy-tee$tl$, $tl$에센셜 헤비 티$tl$, $tl$L$tl$, 1, 45000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10468$tl$, $tl$c07$tl$, $tl$테오 베넷$tl$, $tl$theo.bennett@example.com$tl$, $tl$2026-10-06T06:16:00.000Z$tl$::timestamptz, 95000, 5000, 100000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10468$tl$, $tl$relaxed-crew-sweatshirt$tl$, $tl$릴랙스 크루 스웨트셔츠$tl$, $tl$M$tl$, 1, 95000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10477$tl$, $tl$c05$tl$, $tl$요나스 베버$tl$, $tl$jonas.weber@example.com$tl$, $tl$2026-10-06T06:16:00.000Z$tl$::timestamptz, 320000, 0, 320000, $tl$Cancelled$tl$, $tl$Refunded$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10477$tl$, $tl$meridian-automatic-watch$tl$, $tl$메리디안 오토매틱 워치$tl$, $tl$원사이즈$tl$, 1, 320000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10496$tl$, $tl$c05$tl$, $tl$요나스 베버$tl$, $tl$jonas.weber@example.com$tl$, $tl$2026-10-04T00:18:00.000Z$tl$::timestamptz, 168000, 0, 168000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10496$tl$, $tl$mara-fringed-poncho$tl$, $tl$마라 프린지 포니오$tl$, $tl$L$tl$, 1, 168000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10501$tl$, $tl$c07$tl$, $tl$테오 베넷$tl$, $tl$theo.bennett@example.com$tl$, $tl$2026-10-03T01:19:00.000Z$tl$::timestamptz, 145000, 5000, 150000, $tl$Shipped$tl$, $tl$Paid$tl$, $tl$Boutique$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10501$tl$, $tl$akoya-pearl-strand$tl$, $tl$아코야 펄 스트랜드$tl$, $tl$원사이즈$tl$, 1, 145000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10445$tl$, $tl$c06$tl$, $tl$클라라 모로$tl$, $tl$clara.moreau@example.com$tl$, $tl$2026-10-01T03:21:00.000Z$tl$::timestamptz, 245000, 0, 245000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Boutique$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10445$tl$, $tl$bauletto-top-handle-bag$tl$, $tl$바울레토 탑핸들 백$tl$, $tl$원사이즈$tl$, 1, 245000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10485$tl$, $tl$c08$tl$, $tl$최유나$tl$, $tl$yuna.choi@example.com$tl$, $tl$2026-10-01T03:21:00.000Z$tl$::timestamptz, 145000, 5000, 150000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Boutique$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10485$tl$, $tl$akoya-pearl-strand$tl$, $tl$아코야 펄 스트랜드$tl$, $tl$원사이즈$tl$, 1, 145000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10512$tl$, $tl$c09$tl$, $tl$이자벨 로시$tl$, $tl$isabel.rossi@example.com$tl$, $tl$2026-10-01T03:21:00.000Z$tl$::timestamptz, 385000, 0, 385000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10512$tl$, $tl$rider-leather-jacket$tl$, $tl$라이더 레더 자켓$tl$, $tl$XL$tl$, 1, 385000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10439$tl$, $tl$c08$tl$, $tl$최유나$tl$, $tl$yuna.choi@example.com$tl$, $tl$2026-09-30T04:22:00.000Z$tl$::timestamptz, 226000, 0, 226000, $tl$Cancelled$tl$, $tl$Refunded$tl$, $tl$Boutique$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10439$tl$, $tl$sheer-silk-blouse$tl$, $tl$시어 실크 블라우스$tl$, $tl$S$tl$, 1, 158000) on conflict do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10439$tl$, $tl$layered-pendant-necklace$tl$, $tl$레이어드 펜던트 네클리스$tl$, $tl$원사이즈$tl$, 1, 68000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10515$tl$, $tl$c08$tl$, $tl$최유나$tl$, $tl$yuna.choi@example.com$tl$, $tl$2026-09-30T04:22:00.000Z$tl$::timestamptz, 78000, 5000, 83000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10515$tl$, $tl$stacking-ring-set$tl$, $tl$스태킹 링 세트$tl$, $tl$6$tl$, 1, 78000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10522$tl$, $tl$c10$tl$, $tl$마커스 리드$tl$, $tl$marcus.reed@example.com$tl$, $tl$2026-09-30T04:22:00.000Z$tl$::timestamptz, 140000, 5000, 145000, $tl$Shipped$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10522$tl$, $tl$relaxed-crew-sweatshirt$tl$, $tl$릴랙스 크루 스웨트셔츠$tl$, $tl$M$tl$, 1, 95000) on conflict do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10522$tl$, $tl$essential-heavy-tee$tl$, $tl$에센셜 헤비 티$tl$, $tl$M$tl$, 1, 45000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10421$tl$, $tl$c02$tl$, $tl$엘리아스 마이어$tl$, $tl$elias.meyer@example.com$tl$, $tl$2026-09-28T06:24:00.000Z$tl$::timestamptz, 168000, 0, 168000, $tl$Cancelled$tl$, $tl$Refunded$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10421$tl$, $tl$mara-fringed-poncho$tl$, $tl$마라 프린지 포니오$tl$, $tl$L$tl$, 1, 168000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10487$tl$, $tl$c05$tl$, $tl$요나스 베버$tl$, $tl$jonas.weber@example.com$tl$, $tl$2026-09-27T07:25:00.000Z$tl$::timestamptz, 189000, 0, 189000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Boutique$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10487$tl$, $tl$iris-cotton-dress$tl$, $tl$아이리스 코튼 원피스$tl$, $tl$S$tl$, 1, 189000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10449$tl$, $tl$c06$tl$, $tl$클라라 모로$tl$, $tl$clara.moreau@example.com$tl$, $tl$2026-09-23T03:29:00.000Z$tl$::timestamptz, 401000, 0, 401000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10449$tl$, $tl$stacking-ring-set$tl$, $tl$스태킹 링 세트$tl$, $tl$6$tl$, 2, 78000) on conflict do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10449$tl$, $tl$bauletto-top-handle-bag$tl$, $tl$바울레토 탑핸들 백$tl$, $tl$원사이즈$tl$, 1, 245000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10471$tl$, $tl$c04$tl$, $tl$아멜리아 하트$tl$, $tl$amelia.hart@example.com$tl$, $tl$2026-09-23T03:29:00.000Z$tl$::timestamptz, 373000, 0, 373000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Boutique$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10471$tl$, $tl$suede-overshirt$tl$, $tl$스웨이드 오버셔츠$tl$, $tl$L$tl$, 1, 175000) on conflict do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10471$tl$, $tl$sculpted-heel-boot$tl$, $tl$스컬프티드 힐 부츠$tl$, $tl$39$tl$, 1, 198000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10521$tl$, $tl$c05$tl$, $tl$요나스 베버$tl$, $tl$jonas.weber@example.com$tl$, $tl$2026-09-23T03:29:00.000Z$tl$::timestamptz, 488000, 0, 488000, $tl$Processing$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10521$tl$, $tl$meridian-automatic-watch$tl$, $tl$메리디안 오토매틱 워치$tl$, $tl$원사이즈$tl$, 1, 320000) on conflict do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10521$tl$, $tl$mara-fringed-poncho$tl$, $tl$마라 프린지 포니오$tl$, $tl$L$tl$, 1, 168000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10420$tl$, $tl$c10$tl$, $tl$마커스 리드$tl$, $tl$marcus.reed@example.com$tl$, $tl$2026-09-21T05:31:00.000Z$tl$::timestamptz, 454000, 0, 454000, $tl$Shipped$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10420$tl$, $tl$iris-cotton-dress$tl$, $tl$아이리스 코튼 원피스$tl$, $tl$S$tl$, 1, 189000) on conflict do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10420$tl$, $tl$woven-handle-bag$tl$, $tl$우븐 핸들 백$tl$, $tl$원사이즈$tl$, 1, 265000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10456$tl$, $tl$c10$tl$, $tl$마커스 리드$tl$, $tl$marcus.reed@example.com$tl$, $tl$2026-09-20T06:32:00.000Z$tl$::timestamptz, 198000, 0, 198000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10456$tl$, $tl$sculpted-heel-boot$tl$, $tl$스컬프티드 힐 부츠$tl$, $tl$36$tl$, 1, 198000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10478$tl$, $tl$c01$tl$, $tl$박나연$tl$, $tl$nayeon.park@example.com$tl$, $tl$2026-09-20T06:32:00.000Z$tl$::timestamptz, 68000, 5000, 73000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10478$tl$, $tl$layered-pendant-necklace$tl$, $tl$레이어드 펜던트 네클리스$tl$, $tl$원사이즈$tl$, 1, 68000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10451$tl$, $tl$c01$tl$, $tl$박나연$tl$, $tl$nayeon.park@example.com$tl$, $tl$2026-09-17T01:35:00.000Z$tl$::timestamptz, 236000, 0, 236000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10451$tl$, $tl$stacking-ring-set$tl$, $tl$스태킹 링 세트$tl$, $tl$6$tl$, 1, 78000) on conflict do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10451$tl$, $tl$sheer-silk-blouse$tl$, $tl$시어 실크 블라우스$tl$, $tl$L$tl$, 1, 158000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10426$tl$, $tl$c04$tl$, $tl$아멜리아 하트$tl$, $tl$amelia.hart@example.com$tl$, $tl$2026-09-16T02:36:00.000Z$tl$::timestamptz, 235000, 0, 235000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10426$tl$, $tl$essential-heavy-tee$tl$, $tl$에센셜 헤비 티$tl$, $tl$XL$tl$, 1, 45000) on conflict do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10426$tl$, $tl$relaxed-crew-sweatshirt$tl$, $tl$릴랙스 크루 스웨트셔츠$tl$, $tl$L$tl$, 2, 95000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10459$tl$, $tl$c01$tl$, $tl$박나연$tl$, $tl$nayeon.park@example.com$tl$, $tl$2026-09-16T02:36:00.000Z$tl$::timestamptz, 135000, 5000, 140000, $tl$Shipped$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10459$tl$, $tl$boucle-knit-sweater$tl$, $tl$부클 니트 스웨터$tl$, $tl$L$tl$, 1, 135000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10508$tl$, $tl$c09$tl$, $tl$이자벨 로시$tl$, $tl$isabel.rossi@example.com$tl$, $tl$2026-09-15T03:37:00.000Z$tl$::timestamptz, 420000, 0, 420000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10508$tl$, $tl$savile-suit-jacket$tl$, $tl$서빌 수트 자켓$tl$, $tl$46$tl$, 1, 420000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10470$tl$, $tl$c08$tl$, $tl$최유나$tl$, $tl$yuna.choi@example.com$tl$, $tl$2026-09-14T04:38:00.000Z$tl$::timestamptz, 168000, 0, 168000, $tl$Shipped$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10470$tl$, $tl$mara-fringed-poncho$tl$, $tl$마라 프린지 포니오$tl$, $tl$S$tl$, 1, 168000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10474$tl$, $tl$c08$tl$, $tl$최유나$tl$, $tl$yuna.choi@example.com$tl$, $tl$2026-09-14T04:38:00.000Z$tl$::timestamptz, 145000, 5000, 150000, $tl$Processing$tl$, $tl$Paid$tl$, $tl$Boutique$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10474$tl$, $tl$akoya-pearl-strand$tl$, $tl$아코야 펄 스트랜드$tl$, $tl$원사이즈$tl$, 1, 145000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10484$tl$, $tl$c06$tl$, $tl$클라라 모로$tl$, $tl$clara.moreau@example.com$tl$, $tl$2026-09-14T04:38:00.000Z$tl$::timestamptz, 349000, 0, 349000, $tl$Shipped$tl$, $tl$Paid$tl$, $tl$Boutique$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10484$tl$, $tl$nocturne-leather-jacket$tl$, $tl$녹턴 레더 자켓$tl$, $tl$L$tl$, 1, 349000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10506$tl$, $tl$c03$tl$, $tl$김소라$tl$, $tl$sora.kim@example.com$tl$, $tl$2026-09-13T05:39:00.000Z$tl$::timestamptz, 596000, 0, 596000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10506$tl$, $tl$sistine-belted-trench$tl$, $tl$시스틴 벨티드 트렌치$tl$, $tl$XS$tl$, 2, 298000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10442$tl$, $tl$c03$tl$, $tl$김소라$tl$, $tl$sora.kim@example.com$tl$, $tl$2026-09-12T06:40:00.000Z$tl$::timestamptz, 770000, 0, 770000, $tl$Processing$tl$, $tl$Paid$tl$, $tl$Boutique$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10442$tl$, $tl$rider-leather-jacket$tl$, $tl$라이더 레더 자켓$tl$, $tl$L$tl$, 2, 385000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10513$tl$, $tl$c09$tl$, $tl$이자벨 로시$tl$, $tl$isabel.rossi@example.com$tl$, $tl$2026-09-11T07:41:00.000Z$tl$::timestamptz, 68000, 5000, 73000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10513$tl$, $tl$layered-pendant-necklace$tl$, $tl$레이어드 펜던트 네클리스$tl$, $tl$원사이즈$tl$, 1, 68000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10432$tl$, $tl$c10$tl$, $tl$마커스 리드$tl$, $tl$marcus.reed@example.com$tl$, $tl$2026-09-10T00:42:00.000Z$tl$::timestamptz, 173000, 0, 173000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Boutique$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10432$tl$, $tl$essential-heavy-tee$tl$, $tl$에센셜 헤비 티$tl$, $tl$L$tl$, 1, 45000) on conflict do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10432$tl$, $tl$pleated-wide-leg-trouser$tl$, $tl$플리츠 와이드 팬츠$tl$, $tl$32$tl$, 1, 128000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10475$tl$, $tl$c06$tl$, $tl$클라라 모로$tl$, $tl$clara.moreau@example.com$tl$, $tl$2026-09-09T01:43:00.000Z$tl$::timestamptz, 298000, 0, 298000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10475$tl$, $tl$sistine-belted-trench$tl$, $tl$시스틴 벨티드 트렌치$tl$, $tl$M$tl$, 1, 298000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10476$tl$, $tl$c07$tl$, $tl$테오 베넷$tl$, $tl$theo.bennett@example.com$tl$, $tl$2026-09-09T01:43:00.000Z$tl$::timestamptz, 218000, 0, 218000, $tl$Shipped$tl$, $tl$Paid$tl$, $tl$Boutique$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10476$tl$, $tl$terra-bomber-jacket$tl$, $tl$테라 봄버 자켓$tl$, $tl$L$tl$, 1, 218000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10427$tl$, $tl$c09$tl$, $tl$이자벨 로시$tl$, $tl$isabel.rossi@example.com$tl$, $tl$2026-09-08T02:44:00.000Z$tl$::timestamptz, 218000, 0, 218000, $tl$Processing$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10427$tl$, $tl$terra-bomber-jacket$tl$, $tl$테라 봄버 자켓$tl$, $tl$M$tl$, 1, 218000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10436$tl$, $tl$c05$tl$, $tl$요나스 베버$tl$, $tl$jonas.weber@example.com$tl$, $tl$2026-09-08T02:44:00.000Z$tl$::timestamptz, 189000, 0, 189000, $tl$Processing$tl$, $tl$Paid$tl$, $tl$Boutique$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10436$tl$, $tl$iris-cotton-dress$tl$, $tl$아이리스 코튼 원피스$tl$, $tl$XS$tl$, 1, 189000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10458$tl$, $tl$c07$tl$, $tl$테오 베넷$tl$, $tl$theo.bennett@example.com$tl$, $tl$2026-09-08T02:44:00.000Z$tl$::timestamptz, 245000, 0, 245000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10458$tl$, $tl$bauletto-top-handle-bag$tl$, $tl$바울레토 탑핸들 백$tl$, $tl$원사이즈$tl$, 1, 245000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10448$tl$, $tl$c09$tl$, $tl$이자벨 로시$tl$, $tl$isabel.rossi@example.com$tl$, $tl$2026-09-07T03:45:00.000Z$tl$::timestamptz, 265000, 0, 265000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10448$tl$, $tl$woven-handle-bag$tl$, $tl$우븐 핸들 백$tl$, $tl$원사이즈$tl$, 1, 265000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10472$tl$, $tl$c06$tl$, $tl$클라라 모로$tl$, $tl$clara.moreau@example.com$tl$, $tl$2026-09-07T03:45:00.000Z$tl$::timestamptz, 203000, 0, 203000, $tl$Processing$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10472$tl$, $tl$sheer-silk-blouse$tl$, $tl$시어 실크 블라우스$tl$, $tl$M$tl$, 1, 158000) on conflict do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10472$tl$, $tl$essential-heavy-tee$tl$, $tl$에센셜 헤비 티$tl$, $tl$L$tl$, 1, 45000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10481$tl$, $tl$c02$tl$, $tl$엘리아스 마이어$tl$, $tl$elias.meyer@example.com$tl$, $tl$2026-09-06T04:46:00.000Z$tl$::timestamptz, 565000, 0, 565000, $tl$Shipped$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10481$tl$, $tl$akoya-pearl-strand$tl$, $tl$아코야 펄 스트랜드$tl$, $tl$원사이즈$tl$, 1, 145000) on conflict do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10481$tl$, $tl$savile-suit-jacket$tl$, $tl$서빌 수트 자켓$tl$, $tl$42$tl$, 1, 420000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10422$tl$, $tl$c10$tl$, $tl$마커스 리드$tl$, $tl$marcus.reed@example.com$tl$, $tl$2026-09-05T05:47:00.000Z$tl$::timestamptz, 365000, 0, 365000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10422$tl$, $tl$meridian-automatic-watch$tl$, $tl$메리디안 오토매틱 워치$tl$, $tl$원사이즈$tl$, 1, 320000) on conflict do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10422$tl$, $tl$essential-heavy-tee$tl$, $tl$에센셜 헤비 티$tl$, $tl$M$tl$, 1, 45000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10482$tl$, $tl$c07$tl$, $tl$테오 베넷$tl$, $tl$theo.bennett@example.com$tl$, $tl$2026-09-05T05:47:00.000Z$tl$::timestamptz, 135000, 5000, 140000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Boutique$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10482$tl$, $tl$boucle-knit-sweater$tl$, $tl$부클 니트 스웨터$tl$, $tl$M$tl$, 1, 135000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10500$tl$, $tl$c04$tl$, $tl$아멜리아 하트$tl$, $tl$amelia.hart@example.com$tl$, $tl$2026-09-05T05:47:00.000Z$tl$::timestamptz, 215000, 0, 215000, $tl$Shipped$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10500$tl$, $tl$lug-sole-boot$tl$, $tl$러그 솔 부츠$tl$, $tl$41$tl$, 1, 215000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10463$tl$, $tl$c05$tl$, $tl$요나스 베버$tl$, $tl$jonas.weber@example.com$tl$, $tl$2026-09-04T06:48:00.000Z$tl$::timestamptz, 189000, 0, 189000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Boutique$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10463$tl$, $tl$iris-cotton-dress$tl$, $tl$아이리스 코튼 원피스$tl$, $tl$S$tl$, 1, 189000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10490$tl$, $tl$c03$tl$, $tl$김소라$tl$, $tl$sora.kim@example.com$tl$, $tl$2026-09-03T07:49:00.000Z$tl$::timestamptz, 265000, 0, 265000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10490$tl$, $tl$woven-handle-bag$tl$, $tl$우븐 핸들 백$tl$, $tl$원사이즈$tl$, 1, 265000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10509$tl$, $tl$c07$tl$, $tl$테오 베넷$tl$, $tl$theo.bennett@example.com$tl$, $tl$2026-09-02T00:10:00.000Z$tl$::timestamptz, 350000, 0, 350000, $tl$Processing$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10509$tl$, $tl$suede-overshirt$tl$, $tl$스웨이드 오버셔츠$tl$, $tl$S$tl$, 2, 175000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10437$tl$, $tl$c01$tl$, $tl$박나연$tl$, $tl$nayeon.park@example.com$tl$, $tl$2026-09-01T01:11:00.000Z$tl$::timestamptz, 175000, 0, 175000, $tl$Shipped$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10437$tl$, $tl$suede-overshirt$tl$, $tl$스웨이드 오버셔츠$tl$, $tl$S$tl$, 1, 175000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10519$tl$, $tl$c02$tl$, $tl$엘리아스 마이어$tl$, $tl$elias.meyer@example.com$tl$, $tl$2026-09-01T01:11:00.000Z$tl$::timestamptz, 215000, 0, 215000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10519$tl$, $tl$lug-sole-boot$tl$, $tl$러그 솔 부츠$tl$, $tl$40$tl$, 1, 215000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10428$tl$, $tl$c10$tl$, $tl$마커스 리드$tl$, $tl$marcus.reed@example.com$tl$, $tl$2026-08-31T02:12:00.000Z$tl$::timestamptz, 215000, 0, 215000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Boutique$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10428$tl$, $tl$lug-sole-boot$tl$, $tl$러그 솔 부츠$tl$, $tl$44$tl$, 1, 215000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10435$tl$, $tl$c03$tl$, $tl$김소라$tl$, $tl$sora.kim@example.com$tl$, $tl$2026-08-31T02:12:00.000Z$tl$::timestamptz, 175000, 0, 175000, $tl$Cancelled$tl$, $tl$Refunded$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10435$tl$, $tl$suede-overshirt$tl$, $tl$스웨이드 오버셔츠$tl$, $tl$S$tl$, 1, 175000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10465$tl$, $tl$c10$tl$, $tl$마커스 리드$tl$, $tl$marcus.reed@example.com$tl$, $tl$2026-08-31T02:12:00.000Z$tl$::timestamptz, 838000, 0, 838000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10465$tl$, $tl$sculpted-heel-boot$tl$, $tl$스컬프티드 힐 부츠$tl$, $tl$36$tl$, 1, 198000) on conflict do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10465$tl$, $tl$meridian-automatic-watch$tl$, $tl$메리디안 오토매틱 워치$tl$, $tl$원사이즈$tl$, 2, 320000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10444$tl$, $tl$c08$tl$, $tl$최유나$tl$, $tl$yuna.choi@example.com$tl$, $tl$2026-08-29T04:14:00.000Z$tl$::timestamptz, 68000, 5000, 73000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Boutique$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10444$tl$, $tl$layered-pendant-necklace$tl$, $tl$레이어드 펜던트 네클리스$tl$, $tl$원사이즈$tl$, 1, 68000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10489$tl$, $tl$c07$tl$, $tl$테오 베넷$tl$, $tl$theo.bennett@example.com$tl$, $tl$2026-08-28T05:15:00.000Z$tl$::timestamptz, 128000, 5000, 133000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10489$tl$, $tl$pleated-wide-leg-trouser$tl$, $tl$플리츠 와이드 팬츠$tl$, $tl$30$tl$, 1, 128000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10511$tl$, $tl$c10$tl$, $tl$마커스 리드$tl$, $tl$marcus.reed@example.com$tl$, $tl$2026-08-28T05:15:00.000Z$tl$::timestamptz, 78000, 5000, 83000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Boutique$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10511$tl$, $tl$stacking-ring-set$tl$, $tl$스태킹 링 세트$tl$, $tl$7$tl$, 1, 78000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10479$tl$, $tl$c09$tl$, $tl$이자벨 로시$tl$, $tl$isabel.rossi@example.com$tl$, $tl$2026-08-26T07:17:00.000Z$tl$::timestamptz, 293000, 0, 293000, $tl$Delivered$tl$, $tl$Paid$tl$, $tl$Boutique$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10479$tl$, $tl$sculpted-heel-boot$tl$, $tl$스컬프티드 힐 부츠$tl$, $tl$40$tl$, 1, 198000) on conflict do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10479$tl$, $tl$relaxed-crew-sweatshirt$tl$, $tl$릴랙스 크루 스웨트셔츠$tl$, $tl$XL$tl$, 1, 95000) on conflict do nothing;
+insert into public.orders (id, customer_id, customer_name, customer_email, created_at, subtotal, shipping, total, status, payment, channel) values ($tl$EC-10504$tl$, $tl$c06$tl$, $tl$클라라 모로$tl$, $tl$clara.moreau@example.com$tl$, $tl$2026-08-25T00:18:00.000Z$tl$::timestamptz, 90000, 5000, 95000, $tl$Shipped$tl$, $tl$Paid$tl$, $tl$Online$tl$) on conflict (id) do nothing;
+insert into public.order_items (order_id, product_id, name, size, qty, price) values ($tl$EC-10504$tl$, $tl$essential-heavy-tee$tl$, $tl$에센셜 헤비 티$tl$, $tl$XL$tl$, 2, 45000) on conflict do nothing;
+
+-- Storefront content
+insert into public.settings (id, data) values ('main', $tl${"siteName":"To Lead","siteNameEn":"TO LEAD","brandTagline":"서울에서 시작한, 오래 입는 옷.","logoImage":"","logoLightImage":"","logoMark":"","announcement":"₩150,000 이상 구매 시 무료 배송","announcementSide":"서울 · 뉴욕 · 파리","announcementRight":"고객센터","seoTitle":"To Lead — 오래 입는 옷","seoDescription":"To Lead는 자연 소재와 단정한 실루엣으로 오래 입을 수 있는 옷을 소량 제작합니다.","navNew":"신상품","navWomen":"여성","navMen":"남성","navAccessories":"액세서리","navJournal":"저널","navStory":"브랜드 스토리","mobileNavNote":"서울 · 뉴욕 · 파리","heroEyebrow":"FW26 — 더 조용한 옷장","heroTitle":"덜어낼수록,","heroItalic":"더 선명해집니다.","heroLede":"자연 소재와 단정한 실루엣, 계절이 지나도 변하지 않는 색. 소량으로 제작해 오래 입을 수 있도록 만들었습니다.","heroCta":"컬렉션 보기","heroSecondary":"룩북 살펴보기","heroCaptionLabel":"이번 시즌 추천","heroCaptionName":"아이리스 코튼 원피스","heroCaptionPrice":"₩189,000 — 지금 보기","heroProductId":"iris-cotton-dress","heroImage":"assets/images/hero.jpg","heroImageAlt":"돌계단 위에서 화이트 코튼 원피스를 입은 모델","heroScroll":"스크롤하여 만나보세요","pressLabel":"함께 소개된 매체","press1":"VOGUE","press2":"Elle","press3":"HARPER'S BAZAAR","press4":"GQ","press5":"MONOCLE","categoriesEyebrow":"01 — 둘러보기","categoriesTitle":"오래 입을 옷을 찾으세요.","categoriesNote":"하루의 모든 순간을 위한 단정한 옷. 유행이 아닌 옷장을 중심으로 구성했습니다.","categoriesCta":"전체 상품","catWomenTitle":"여성","catWomenMeta":"균형 잡힌 옷장","catWomenImage":"assets/images/category-women.jpg","catWomenAlt":"아이보리 블라우스가 걸린 옷장","catMenTitle":"남성","catMenMeta":"조용한 테일러링","catMenImage":"assets/images/category-men.jpg","catMenAlt":"화이트 헤비 코튼 티를 입은 남성","catAccTitle":"액세서리","catAccMeta":"마지막을 완성하는 오브제","catAccImage":"assets/images/category-accessories.jpg","catAccAlt":"오렌지 컬러 우븐 레더 백","newEyebrow":"02 — 방금 도착한","newTitle":"신상품.","newCta":"신상품 전체 보기","editorialEyebrow":"FW26 에디트","editorialTitle":"부드러운 구조,","editorialItalic":"조용한 확신.","editorialLede":"질감과 비율, 그리고 오래 곁에 남는 옷에 대한 탐구.","editorialCta":"에디트 쇼핑하기","editorialImage":"assets/images/editorial.jpg","editorialAlt":"드라이 팜파스와 뉴트럴 컬러 의류가 걸린 랙","editorialIndex":"FW26 / 03","storyEyebrow":"04 — 우리의 방식","storyTitle":"더 적게, 더 좋게.","storyItalic":"의도적으로.","storyP1":"포르투갈, 이탈리아, 한국의 작은 메이커들과 함께 소량으로 제작합니다. 첫 착용부터 단정하고, 시간이 지날수록 더 좋아지는 옷을 만드는 것이 목표입니다.","storyP2":"자연 소재. 정직한 구조. 유행을 타지 않는 색.","storySignature":"— To Lead 스튜디오","storyImage":"assets/images/story.jpg","storyAlt":"따뜻한 톤의 의류가 걸린 To Lead 스튜디오","storyStamp":"소량 제작\n2019년부터","storyStat1Value":"30","storyStat1Label":"시즌당 아이템","storyStat2Value":"12","storyStat2Label":"협업 메이커","storyStat3Value":"96%","storyStat3Label":"천연 소재","value1Title":"천연 소재","value1Text":"울, 실크, 리넨, 유기농 코튼. 촉감과 시간에 따른 변화를 기준으로 고릅니다.","value2Title":"소량 생산","value2Text":"협업 아틀리에와 한정 수량으로 제작해 과잉 생산과 폐기를 줄입니다.","value3Title":"30일 반품","value3Text":"천천히 결정하세요. 배송 후 30일 이내 무료로 반품할 수 있습니다.","value4Title":"탄소중립 배송","value4Text":"모든 주문은 재생·재활용 포장재로 탄소중립 배송됩니다.","newsletterEyebrow":"프라이빗 리스트","newsletterTitle":"조용한 리스트에","newsletterItalic":"함께하세요.","newsletterCopy":"신상품과 스튜디오 노트, 가끔의 초대를 가장 먼저 받아보세요. 한 달에 두 번을 넘지 않습니다.","newsletterButton":"구독하기","newsletterNote":"구독 시 개인정보 처리방침에 동의하게 됩니다. 언제든 해지할 수 있습니다.","newsletterSuccessTitle":"리스트에 등록되었습니다.","newsletterSuccessText":"스튜디오의 편지와 FW26 신상품 소식을 가장 먼저 보내드릴게요.","footerBlurb":"소량으로 만든 단정한 옷과 오브제. 자주 입고 오래 간직할 수 있도록 디자인합니다.","socialInstagram":"인스타그램","socialPinterest":"핀터레스트","socialTikTok":"틱톡","footerShopTitle":"쇼핑","footerCareTitle":"고객 지원","footerStudioTitle":"스튜디오","footerContactTitle":"문의","footerShippingLabel":"배송 및 반품","footerSizeLabel":"사이즈 가이드","footerCareLabel":"관리 가이드","footerFaqLabel":"자주 묻는 질문","footerStoryLabel":"브랜드 스토리","footerJournalLabel":"저널","footerStockistsLabel":"판매처","footerCareersLabel":"채용","footerPrivacyLabel":"개인정보 처리방침","footerTermsLabel":"이용약관","footerAccessibilityLabel":"접근성","supportEmail":"care@tolead.kr","supportPhone":"02-541-2019","contactAddress":"서울특별시 성동구 연무장길 42\nTo Lead 스튜디오","copyright":"© {year} To Lead. 모든 권리 보유.","shopAllEyebrow":"컬렉션","shopAllTitle":"모든","shopAllItalic":"아이템.","shopAllDesc":"이번 시즌의 모든 아이템. 함께 입고 오래 간직할 수 있도록 디자인했습니다.","shopAllIndex":"03","shopNewEyebrow":"방금 도착한","shopNewTitle":"새로운","shopNewItalic":"도착.","shopNewDesc":"스튜디오 옷장에 가장 먼저 들어온 아이템. 한정 수량으로 제작했습니다.","shopNewIndex":"01","shopWomenEyebrow":"여성 에디트","shopWomenTitle":"조용히","shopWomenItalic":"선명하게.","shopWomenDesc":"유려한 테일러링과 부드러운 구조, 자연 소재로 일상을 위한 옷을 제안합니다.","shopWomenIndex":"04","shopMenEyebrow":"남성 에디트","shopMenTitle":"오래 입도록","shopMenItalic":"만들어진.","shopMenDesc":"정직한 소재와 편안한 테일러링. 더 많은 순간에 어울리는 옷장입니다.","shopMenIndex":"05","shopAccEyebrow":"마지막을 완성하는","shopAccTitle":"작은","shopAccItalic":"기쁨.","shopAccDesc":"가죽과 골드, 프레시워터 펄. 경쟁하지 않고 완성하는 오브제.","shopAccIndex":"06","shopSaleEyebrow":"아카이브","shopSaleTitle":"마지막","shopSaleItalic":"아이템.","shopSaleDesc":"지난 시즌의 마지막 수량을 조용한 가격으로. 사이즈는 한정되어 있습니다.","shopSaleIndex":"07","shopNoteEyebrow":"의도된 디자인","shopNoteText":"모든 아이템은 한정 수량으로 제작됩니다. 품절된 상품은 조용한 리스트에 가입하면 다음 드롭을 가장 먼저 만날 수 있습니다.","shopNoteCta":"리스트 가입하기","shopEmptyEyebrow":"아무것도 없습니다","shopEmptyTitle":"조건에 맞는 아이템이 없습니다.","shopEmptyText":"다른 카테고리를 선택하거나 검색어를 지워보세요. 전체 컬렉션은 언제나 가까이 있습니다.","shopEmptyCta":"전체 상품 보기","pdpBreadcrumbHome":"홈","pdpBreadcrumbCollection":"컬렉션","pdpGalleryLabel":"상품 이미지","pdpGalleryFull":"전체","pdpGalleryDetail":"디테일","pdpGalleryTexture":"질감","pdpGalleryNote":"스튜디오 이미지 · {sku}","pdpColourLabel":"컬러","pdpSizeLabel":"사이즈","pdpSizeGuideLink":"사이즈 가이드","pdpAddToBag":"쇼핑백에 담기","pdpSoldOut":"품절","pdpSelectSize":"사이즈 선택","pdpStockOut":"품절 — 조용한 리스트에 가입하면 다음 드롭을 가장 먼저 만날 수 있습니다","pdpStockSelect":"사이즈를 선택하면 쇼핑백에 담을 수 있습니다","pdpStockLow":"{count}개 남음 — 바로 발송 가능","pdpStockIn":"재고 있음 — 1–2 영업일 내 발송","pdpReviewsLink":"리뷰 {count}개","pdpSave":"{percent}% 할인","pdpSaveToWishlist":"위시리스트에 저장","pdpNotFoundTitle":"상품을 찾을 수 없습니다.","pdpNotFoundText":"아카이브로 이동되었을 수 있습니다. 나머지 컬렉션이 기다리고 있습니다.","pdpNotFoundCta":"컬렉션 둘러보기","pdpAssurance1":"{freeShipping} 이상 무료 배송","pdpAssurance2":"30일 무료 반품","pdpAssurance3":"탄소중립 포장 배송","pdpDetailsTitle":"상세 및 핏","pdpCareTitle":"소재 및 관리","pdpDeliveryTitle":"배송 및 반품","pdpDeliveryText":"주문 후 1–2 영업일 내 발송됩니다. {freeShipping} 이상 무료 배송, 그 외 배송비 {shippingFee}. 수령 후 30일 이내 미착용 상태로 반품 가능합니다. 문의: {email}","pdpDemoNote":"이 페이지는 프런트엔드 데모입니다. 상품 재고와 결제는 브라우저에서 시뮬레이션됩니다.","pdpSizeNote":"사이즈 사이에 계시다면 여유로운 핏을 위해 한 사이즈 업을 권장합니다. 개인 상담은 {email}로 문의해 주세요.","reviewsEyebrow":"리뷰","reviewsTitle":"입어보고 사랑한 옷.","reviewsWrite":"리뷰 작성하기","reviewsBasedOn":"리뷰 {count}개 기준","reviewVerified":"구매 인증","reviewCommunity":"커뮤니티 리뷰","reviewFormTitle":"당신의 생각을 들려주세요","reviewNameLabel":"이름","reviewRatingLabel":"평점","reviewTitleLabel":"한 줄 제목","reviewTextLabel":"리뷰 내용","reviewNamePlaceholder":"이름","reviewTitlePlaceholder":"짧은 한 줄 제목","reviewTextPlaceholder":"핏, 소재, 마감에 대해 들려주세요","reviewRating5":"5점 — 최고예요","reviewRating4":"4점 — 아주 좋아요","reviewRating3":"3점 — 좋아요","reviewRating2":"2점 — 보통이에요","reviewRating1":"1점 — 아쉬워요","reviewSubmit":"리뷰 등록","reviewNote":"리뷰는 데모를 위해 이 브라우저에 저장됩니다.","reviewThanks":"감사합니다 — 리뷰가 등록되었습니다.","relatedEyebrow":"이어서 둘러보기","relatedTitle":"함께 어울리는 아이템.","relatedCta":"전체 상품 보기","freeShipping":150000,"shippingFee":5000,"currencyLabel":"KRW ₩"}$tl$::jsonb) on conflict (id) do nothing;
+
+-- Newsletter subscribers
+insert into public.subscribers (email) values ($tl$hello@studio-north.com$tl$) on conflict (email) do nothing;
+insert into public.subscribers (email) values ($tl$mari@example.com$tl$) on conflict (email) do nothing;
+
+-- Recompute customer purchase history totals
+select public.refresh_customer_totals(id) from public.customers;

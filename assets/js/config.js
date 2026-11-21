@@ -14,7 +14,7 @@
    to the database. See README.md → "Supabase backend" for setup steps. */
 window.TOLEAD_CONFIG = {
   supabaseUrl: 'https://wbkwxhhgjwubrbdusucn.supabase.co',
-  supabaseAnonKey: '',
+  supabaseAnonKey: 'sb_publishable_IxsLNYikka1tnh2eMX9BjQ_xSo_iajI',
   /* Row id used for the shared storefront content/settings document. */
   storeId: 'main',
   /* On a completely empty project, push the bundled demo catalogue once so the

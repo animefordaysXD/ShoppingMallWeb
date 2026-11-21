@@ -62,12 +62,14 @@ window.TOLEAD_CONFIG = {
 
 ### 2. 스키마와 시드
 
-Supabase Dashboard → **SQL Editor**에서 순서대로 실행합니다.
+가장 간단한 방법은 Supabase Dashboard → **SQL Editor**에서 `supabase/setup.sql`을 한 번 실행하는 것입니다. 이 파일은 스키마와 데모 데이터를 모두 포함합니다.
+
+개별 실행을 원하면 순서대로:
 
 1. `supabase/schema.sql` — 테이블, 트리거, 뷰, RLS 정책, 체크아웃 RPC.
 2. `supabase/seed.sql` — 데모 상품 21개, 고객 10명, 주문 104건, 콘텐츠 설정을 그대로 이식합니다. (선택)
 
-`seedOnEmpty: true`이면 DB가 완전히 비어 있을 때 첫 방문에서 번들 데모 데이터를 자동으로 넣습니다. 빈 스토어로 시작하려면 `false`로 바꾸세요.
+`seedOnEmpty: true`이면 스키마만 있고 데이터가 전혀 없는 DB에서 첫 방문 시 번들 데모를 넣으려고 시도합니다. RLS가 켜진 상태에서는 인증된 세션 또는 `demo-policies.sql`이 필요하므로, 보통은 `setup.sql`로 시드까지 함께 넣는 편이 확실합니다. 빈 스토어로 시작하려면 `seedOnEmpty`를 `false`로 바꾸세요.
 
 | 테이블 | 용도 |
 | --- | --- |
@@ -176,6 +178,7 @@ ShoppingMallWeb/
 │       ├── product.js      PDP 동작
 │       └── admin.js        관리자 셸, 라우팅, 모든 뷰
 ├── supabase/
+│   ├── setup.sql           스키마 + 시드 한 번에 실행 (권장)
 │   ├── schema.sql          테이블·트리거·뷰·RLS·체크아웃 RPC
 │   ├── seed.sql            데모 데이터 이식용 SQL
 │   ├── demo-policies.sql   공개 데모용 anon 쓰기 정책 (선택)

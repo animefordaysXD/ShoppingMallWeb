@@ -147,6 +147,7 @@
 | `assets/js/config.js` | Supabase URL/anon key/시드 옵션 (신규) |
 | `assets/js/backend.js` | Supabase REST/Auth 어댑터, 행↔앱 매핑, 체크아웃 RPC (신규) |
 | `supabase/schema.sql` | 테이블·트리거·뷰·RLS·`place_order` RPC (신규) |
+| `supabase/setup.sql` | 스키마+시드 통합 실행 파일 (신규) |
 | `supabase/seed.sql` | 데모 데이터 SQL (신규, `generate-seed.mjs`로 생성) |
 | `supabase/demo-policies.sql` / `production-policies.sql` | 데모용 anon 정책 적용/해제 (신규) |
 | `supabase/generate-seed.mjs` | `seed.sql` 재생성 스크립트 (신규) |
@@ -181,7 +182,7 @@
 - **GitHub Pages 준비**: 빌드 없이 루트 배포 그대로 동작하며, `README.md`에 Pages 설정과 Supabase 설정 절차를 정리했습니다.
 
 ### 라이브 연결 후 확인 체크리스트
-- [x] PGlite(실제 Postgres 16 WASM)에서 `schema.sql` / `seed.sql` 실행 — 테이블 8개, 상품 21개, 고객 10명, 주문 104건, 주문 항목 135건 생성
+- [x] PGlite(실제 Postgres WASM)에서 `schema.sql` / `seed.sql` / `setup.sql` 실행 — 테이블 8개, 상품 21개, 고객 10명, 주문 104건, 주문 항목 135건 생성
 - [x] `place_order` RPC 호출 — 주문·항목 생성, 재고 차감, 고객 `total_spent`/`order_count` 트리거 갱신, `customer_purchase_history` 뷰 확인
 - [x] `demo-policies.sql` / `production-policies.sql` 실행 확인
 - [x] 모의 Supabase REST/Auth 서버로 하이드레이션, 관리자 로그인, 상품·콘텐츠·주문 상태 write-through, 체크아웃 RPC, 전체 초기화, 토큰 갱신 검증

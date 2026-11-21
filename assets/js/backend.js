@@ -74,14 +74,14 @@
     if (refreshPromise) return refreshPromise;
     if (!session || !session.refresh_token) {
       clearSession();
-      return Promise.resolve(anonKey);
+      return Promise.resolve('');
     }
     refreshPromise = tokenRequest({ grant_type: 'refresh_token', refresh_token: session.refresh_token }).then(function (data) {
       writeSession(sessionFromToken(data, session.email));
       return data.access_token;
     }, function () {
       clearSession();
-      return anonKey;
+      return '';
     }).then(function (token) {
       refreshPromise = null;
       return token;
@@ -90,7 +90,7 @@
   }
 
   function accessToken() {
-    if (!session) return Promise.resolve(anonKey);
+    if (!session) return Promise.resolve('');
     if (tokenIsFresh()) return Promise.resolve(session.access_token);
     return refreshAccessToken();
   }
@@ -109,9 +109,9 @@
     return accessToken().then(function (token) {
       var headers = {
         apikey: anonKey,
-        Authorization: 'Bearer ' + (token || anonKey),
         'Content-Type': 'application/json'
       };
+      if (token) headers.Authorization = 'Bearer ' + token;
       if (options.prefer) headers.Prefer = options.prefer;
       var init = { method: options.method || 'GET', headers: headers };
       if (options.body !== undefined) init.body = JSON.stringify(options.body);
